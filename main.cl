@@ -1789,7 +1789,11 @@ by keyword symbols and not by strings"
 			 sock 
 			 #'check-for-open-socket-before-gc))
 		
-		; track all the ipaddrs by which we're reachable
+                                        ; track all the ipaddrs by which we're reachable
+                ;;
+		;; Have to fix IPv6 before the below will work. 
+		;;
+		#+nil
 		(if* (not (member (setq localhost (socket:local-host sock))
 				  ipaddrs))
 		   then ; new ip address by which this machine is known
