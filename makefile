@@ -1,7 +1,10 @@
 # On Windows, this makefile requires the use of GNU make from Redhat
 # (http://sources.redhat.com/cygwin/).
 
-SHELL = sh
+# Export everything
+export
+
+SHELL = bash
 
 ## First, so it can set variables and even change the default rule
 makefile_local = $(shell if test -f makefile.local;then echo makefile.local;fi)
@@ -14,7 +17,14 @@ on_windows = $(shell if test -d "c:/"; then echo yes; else echo no; fi)
 use_dcl = $(shell if test -f ../dcl.dxl; then echo yes; else echo no; fi)
 
 ifeq ($(use_dcl),yes)
-mlisp = ../lisp
+
+on_macOS = $(shell if test `uname -s` = Darwin; then echo yes; fi)
+
+ifeq ($(on_macOS),yes)
+mlisp_env = MACHINE=x86 OS_NAME=darwin source ../scm-bin/aclbuildenv.sh &&
+endif
+
+mlisp = $(mlisp_env) ../lisp
 image = dcl.dxl
 endif
 
@@ -58,13 +68,16 @@ test.tmp: FORCE
 	echo '(setq user::*do-aserve-test* nil)' >> test.tmp
 ifeq ($(COMPILE_TESTS),yes)
 	echo '(load (compile-file "test/t-aserve.cl"))' >> test.tmp
+	echo '(load (compile-file "webactions/test/t-webactions.cl"))' >> test.tmp
 else
 	echo '(load "test/t-aserve.cl")' >> test.tmp
+	echo '(load "webactions/test/t-webactions.cl")' >> test.tmp
 endif
 
 # Run tests with default setting of *hiper-socket-is-stream-socket* switch.
 test: test.tmp
 	echo '(time (test-aserve-n :n 1 :exit nil))' >> test.tmp
+	echo '(time (net.aserve.testwa::test-webactions))'  >> test.tmp
 	$(mlisp) -L test.tmp -kill
 
 test-do-hiper: test.tmp
@@ -102,8 +115,10 @@ test-from-asdf: FORCE
 	echo "(asdf:operate 'asdf:load-op :aserve)" >> build.tmp
 ifeq ($(COMPILE_TESTS),yes)
 	echo '(time (load (compile-file "test/t-aserve.cl")))' >> build.tmp
+	echo '(time (load (compile-file "webactions/test/t-webactions.cl")))' >> build.tmp
 else
 	echo '(time (load "test/t-aserve.cl"))' >> build.tmp
+	echo '(time (load "webactions/test/t-webactions.cl"))' >> build.tmp
 endif
 	echo '(exit util.test::*test-errors*)' >> build.tmp
 	$(mlisp) -L build.tmp -kill
@@ -125,6 +140,9 @@ cleanall distclean: clean
 tags: FORCE
 	rm -f TAGS
 	find . -name '*.cl' -print | xargs etags -a
+
+doclinks:
+	cd doc && ./doclinks.py
 
 FORCE:
 

@@ -40,7 +40,8 @@
 		:initform "webaction"
 		:reader sm-cookie-name)
    
-   (websessions  :initform (make-hash-table :test #'equal)
+   (websessions  :initform (make-hash-table :test #'equal
+					    #+sbcl :synchronized #+sbcl t)
 		 :reader sm-websessions)))
 
 ;; Mention class in make-instance after class def to avoid bug24329.
@@ -99,12 +100,9 @@
 
 (defun compute-prefix-suffix (sm)
   ;; compute the prefix string and suffix value
-  ; randomize the random number generator
+
+  ;; randomize the random number generator
   (dotimes (i (logand (get-universal-time) #xfff)) (random 256))
-  
-  #+unix
-  (dotimes (i (logand (excl::filesys-inode ".") #xfff)) (random 256))
-  (dotimes (i (logand (get-universal-time) #xff)) (random 256))
   
   (let ((val 1))
     (dotimes (i 4)

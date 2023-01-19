@@ -67,6 +67,16 @@
     :initarg :cookies
     :initform nil)
    
+   (cookie-string ;; if there are cookies then this is what's put in the header
+    :reader client-request-cookie-string
+    :initarg :cookie-string
+    :initform nil)
+   
+   (accept  ;; the client's Accept header value
+    :reader client-request-accept
+    :initarg :accept
+    :initform nil)
+   
    (return-connection
     ;; set to
     ;;  :maybe - would like to return but only if no errors
@@ -88,6 +98,12 @@
     :initarg :deferred-content
     :initform nil
     :accessor client-request-deferred-content)
+   
+   (cacheable
+    ;; true if the response is cacheable assuming the 
+    ;; response permits it
+    :initarg :cacheable
+    :accessor client-request-cacheable)
    ))
 
 
@@ -126,6 +142,94 @@
 	     :accessor digest-response)
    
    ))
+
+
+;; This class is meant to be subclassed.
+;; Instances of this class can be passed as the content argument
+;; to do-http-request in order to dynamically produced the content
+;; to be sent with the http request to the web server.
+(defclass computed-content ()
+  nil)
+
+(defgeneric get-content-length (cc)
+  (:documentation "returns the number of bytes in the content")
+  (:method ((cc computed-content))
+    (declare (ignore cc))))
+
+(defgeneric get-content-headers (cc &key protocol headers)
+  (:documentation "takes protocol and headers specified by the caller
+of do-http-request and returns additional content-specific headers to
+be included; can signal errors, but cannot modify the existing
+headers")
+  ;; Protocol and headers are passed as keyword arguments to prohibit
+  ;; multiple dispatch which may easily get out of hand when default
+  ;; methods are available.
+  (:method ((cc computed-content) &key protocol headers)
+    (declare (ignore protocol headers))))
+
+(defgeneric write-content (cc stream)
+  (:documentation "writes the content to the given stream")
+  (:method ((cc computed-content) stream)
+    (declare (ignore cc stream))))
+
+
+;; This subclass of computed-content will send the contents
+;; of a file to the web server.
+(defclass file-computed-content (computed-content)
+  ((filename :initarg :filename :reader fcc-filename)))
+
+(defmethod get-content-length ((fcc file-computed-content))
+  (with-open-file (p (fcc-filename fcc) :direction :input)
+    (file-length p)))
+
+(defmethod write-content ((fcc file-computed-content) stream)
+  (let ((buffer (make-array 4096 :element-type '(unsigned-byte 8))))
+    (with-open-file (p (fcc-filename fcc)
+                     :direction :input)
+      (loop
+        (let ((size (read-sequence buffer p)))
+          (if* (eql 0 size)
+             then (return)
+             else (write-sequence buffer stream :end size)))))))
+
+
+;; This subclass of computed-content will send the data from the
+;; specified stream, using the chunking mechanism.
+(defclass stream-computed-content (computed-content)
+  ((stream :initarg :stream
+           :reader stream-computed-content-stream)))
+
+(defmethod get-content-length ((scc stream-computed-content))
+  nil)
+
+(defmethod get-content-headers ((scc stream-computed-content) &key protocol headers)
+  (let ((transfer-encoding (cdr (assoc "Transfer-Encoding" headers :test #'equalp))))
+    (if* (not (eq protocol :http/1.1))
+       then (error "STREAM-COMPUTED-CONTENT uses chunking mechanism ~
+                    which is only supported by HTTP/1.1.")
+     elseif (null transfer-encoding)
+       then '(("Transfer-Encoding" . "chunked"))
+     elseif (string= transfer-encoding "chunked")
+       then nil ;; correct Transfer-Encoding header is already there
+       else (error "Conflicting value of Transfer-Encoding header (~s): ~
+                    STREAM-COMPUTED-CONTENT uses AllegroServe's plain chunking ~
+                    mechanism so only \"chunked\" value is allowed."
+                   transfer-encoding))))
+
+(defmethod write-content ((scc stream-computed-content) stream)
+  ;; Copy data from in-stream to out-stream.
+  (let* ((out-stream (net.aserve::make-instance-chunking-stream+output-handle stream))
+         (in-stream (stream-computed-content-stream scc))
+         (buffer (make-array 4096 :element-type (stream-element-type in-stream)))
+         (num-elements nil))
+    (loop
+       (setf num-elements (read-sequence buffer in-stream))
+       (when (zerop num-elements)
+         (return))
+       (write-sequence buffer out-stream :end num-elements))
+    (force-output out-stream)
+    (close out-stream)))
+
 
 
 (defvar crlf (make-array 2 :element-type 'character
@@ -269,6 +373,12 @@
 ;; bug22596
 (defparameter *default-retry-on-timeout* nil)
 
+(defparameter *redirect-codes*
+    '(#.(net.aserve::response-number *response-found*)
+      #.(net.aserve::response-number *response-moved-permanently*)
+      #.(net.aserve::response-number *response-temporary-redirect*)
+      #.(net.aserve::response-number *response-see-other*)))
+
 (defun do-http-request (uri 
 			&rest args
 			&key 
@@ -312,6 +422,7 @@
 			max-depth
 			connection ; existing socket to the server
 			read-body-hook
+                        cache  ;; client-cache object
 			
                         ;; internal
 			recursing-call ; true if we are calling ourself
@@ -352,8 +463,38 @@
 	       :verify verify
 	       :max-depth max-depth
 	       :connection connection
+               :cache cache
 	       )))
 
+    (if* (consp creq)
+       then ;; cache validation has computed the answer already
+            (return-from do-http-request (values-list creq)))
+    
+    (if* (typep creq 'cache-entry)
+       then ;; make-http-client-request returned a cache entry 
+            ;; which has all the needed values
+            (return-from do-http-request 
+              (if* (and (member (centry-code creq) *redirect-codes*)
+                        redirect
+                        (if* (integerp redirect)
+                           then (> redirect 0)
+                           else t))
+                 then (let ((new-location (cdr (assoc :location (centry-headers creq)))))
+                        (apply #'do-http-request 
+                               (net.uri:merge-uris new-location uri)
+                               :redirect
+                               (if* (integerp redirect)
+                                  then (1- redirect)
+                                  else redirect)
+                               args))
+                 else
+                    
+                      (values (centry-body creq)
+                              (centry-code creq)
+                              (centry-headers creq)
+                              uri
+                              ))))
+    
     (unwind-protect
 	(let (new-location) 
 
@@ -389,110 +530,110 @@
 		  (setf (client-request-return-connection creq) nil))
 	  
 		  
-	  (if* (and (member (client-request-response-code creq)
-			    '(#.(net.aserve::response-number *response-found*)
-			      #.(net.aserve::response-number *response-moved-permanently*)
-			      #.(net.aserve::response-number *response-temporary-redirect*)
-			      #.(net.aserve::response-number *response-see-other*))
-			    :test #'eq)
-		    redirect
-		    (member method redirect-methods :test #'eq)
-		    (if* (integerp redirect)
-		       then (> redirect 0)
-		       else t))		; unrestricted depth
-	     then
-		  (setq new-location
-		    (cdr (assoc :location (client-request-headers creq)
-				:test #'eq))))
+	  (if* (and (member (client-request-response-code creq) *redirect-codes*
+                            :test #'eq)
+                    redirect
+                    (member method redirect-methods :test #'eq)
+                    (if* (integerp redirect)
+                       then (> redirect 0)
+                       else t))		; unrestricted depth
+             then
+                  (setq new-location
+                    (cdr (assoc :location (client-request-headers creq)
+                                :test #'eq))))
 	
-	  (if* (and digest-authorization
-		    (equal (client-request-response-code creq)
-			   #.(net.aserve::response-number 
-			      *response-unauthorized*))
-		    (not recursing-call))
-	     then ; compute digest info and retry
-		  (if* (compute-digest-authorization 
-			creq digest-authorization)
-		     then (client-request-close creq)
-			  (return-from do-http-request
-			    (apply #'do-http-request
-				   uri
-				   :recursing-call t
-				   args))))
+          (if* (and digest-authorization
+                    (equal (client-request-response-code creq)
+                           #.(net.aserve::response-number 
+                              *response-unauthorized*))
+                    (not recursing-call))
+             then ; compute digest info and retry
+                  (if* (compute-digest-authorization 
+                        creq digest-authorization)
+                     then (client-request-close creq)
+                          (return-from do-http-request
+                            (apply #'do-http-request
+                                   uri
+                                   :recursing-call t
+                                   args))))
 		  
           ;; auto-retry if request times out.
-	  (if* (and (eq (client-request-response-code creq)
-			#.(net.aserve::response-number *response-request-timeout*))
-		    (if (integerp retry-on-timeout)
-			(> retry-on-timeout 0)
-		      retry-on-timeout))
-	     then (net.aserve::debug-format :info "Received 408 response. Retrying request because retry-on-timeout is ~a.." retry-on-timeout)
-		  (return-from do-http-request
-		    (apply #'do-http-request
-			   uri
-			   :retry-on-timeout
-			   (if* (integerp retry-on-timeout)
-			      then (1- retry-on-timeout)
-			      else retry-on-timeout)
-			   :recursing-call t
-			   args)))
+          (if* (and (eq (client-request-response-code creq)
+                        #.(net.aserve::response-number *response-request-timeout*))
+                    (if (integerp retry-on-timeout)
+                        (> retry-on-timeout 0)
+                      retry-on-timeout))
+             then (net.aserve::debug-format :info "Received 408 response. Retrying request because retry-on-timeout is ~a.." retry-on-timeout)
+                  (return-from do-http-request
+                    (apply #'do-http-request
+                           uri
+                           :retry-on-timeout
+                           (if* (integerp retry-on-timeout)
+                              then (1- retry-on-timeout)
+                              else retry-on-timeout)
+                           :recursing-call t
+                           args)))
 
-	  (if* (or (and (null new-location) 
+          (if* (or (and (null new-location) 
                         ; not called when redirecting
-			(if* (functionp skip-body)
-			   then (funcall skip-body creq)
-			   else skip-body))
-		   (member (client-request-response-code creq)
-			   ' (#.(net.aserve::response-number 
-				 *response-no-content*)
-				#.(net.aserve::response-number 
-				   *response-not-modified*)
-				))
-		   (and (eq method :connect)
-			(eq (client-request-response-code creq)
-			    #.(net.aserve::response-number *response-ok*))))
-	     then
-		  (return-from do-http-request
-		    (values 
-		     nil		; no body
-		     (client-request-response-code creq)
-		     (client-request-headers  creq)
-		     (client-request-uri creq)
-		     (and (client-request-return-connection creq)
-			  (setf (client-request-return-connection creq)
-			    :yes)
-			  (client-request-socket creq))
-		     )))
+                        (if* (functionp skip-body)
+                           then (funcall skip-body creq)
+                           else skip-body))
+                   (member (client-request-response-code creq)
+                           ' (#.(net.aserve::response-number 
+                                 *response-no-content*)
+                                #.(net.aserve::response-number 
+                                   *response-not-modified*)
+                                ))
+                   (and (eq method :connect)
+                        (eq (client-request-response-code creq)
+                            #.(net.aserve::response-number *response-ok*))))
+             then
+                  (return-from do-http-request
+                    (values 
+                     nil		; no body
+                     (client-request-response-code creq)
+                     (client-request-headers  creq)
+                     (client-request-uri creq)
+                     (and (client-request-return-connection creq)
+                          (setf (client-request-return-connection creq)
+                            :yes)
+                          (client-request-socket creq))
+                     )))
 	  
-	  (if* read-body-hook
-	     then (funcall read-body-hook creq :format format)
-	     else (let ((body (read-response-body creq :format format)))
-		    (net.aserve::debug-format :xmit-client-response-body "~s" body)
+          (if* read-body-hook
+             then (funcall read-body-hook creq :format format)
+             else (let ((body (read-response-body creq :format format)))
+                    (net.aserve::debug-format :xmit-client-response-body "~s" body)
 		    
 		    
 		    
-		    (if* new-location
-		       then			; must do a redirect to get to the real site
-			    (client-request-close creq)
-			    (apply #'do-http-request
-				   (net.uri:merge-uris new-location uri)
-				   :redirect
-				   (if* (integerp redirect)
-				      then (1- redirect)
-				      else redirect)
-				   args)
-		       else (if* (client-request-return-connection creq)
-			       then (setf (client-request-return-connection creq)
-				      :yes)
-			       else (client-request-close creq))
-				    
-			    (values 
-			     body
-			     (client-request-response-code creq)
-			     (client-request-headers  creq)
-			     (client-request-uri creq)
-			     (client-request-socket creq)
-			     )))))
+                    (if* (client-request-cacheable creq)
+                       then (insert-into-cache cache
+                                               creq
+                                               body))
+                    (if* new-location
+                       then			; must do a redirect to get to the real site
+                            (client-request-close creq)
+                            (apply #'do-http-request
+                                   (net.uri:merge-uris new-location uri)
+                                   :redirect
+                                   (if* (integerp redirect)
+                                      then (1- redirect)
+                                      else redirect)
+                                   args)
+                       else (if* (client-request-return-connection creq)
+                               then (setf (client-request-return-connection creq)
+                                      :yes)
+                               else (client-request-close creq))
+
+                            (values 
+                             body
+                             (client-request-response-code creq)
+                             (client-request-headers  creq)
+                             (client-request-uri creq)
+                             (client-request-socket creq)
+                             )))))
       
       ;; protected form:
       (and (not read-body-hook) (client-request-close creq)))))
@@ -720,17 +861,22 @@
 
 (defun send-request-body (sock content)
   (if* content
-     then ; content can be a vector or a list of vectors
+     then ;; content can be a vector or a list of vectors
+          ;; or a computed-content object
 	  (dolist (cont content)
-	    (net.aserve::debug-format
-	     :info "client sending content of ~d characters/bytes"
-	     (length cont))
-	    (net.aserve::debug-format
-	     :xmit-client-request-body
-	     "~s" (if (stringp cont)
-		      cont
-		    (octets-to-string cont :external-format :octets)))
-	    (write-sequence cont sock))))
+            (typecase cont
+              (computed-content
+               (write-content cont sock))
+              (t 
+               (net.aserve::debug-format
+                :info "client sending content of ~d characters/bytes"
+                (length cont))
+               (net.aserve::debug-format
+                :xmit-client-request-body
+                "~s" (if (stringp cont)
+                         cont
+                       (octets-to-string cont :external-format :octets)))
+               (write-sequence cont sock))))))
 
 (defun ssl-has-sni-p ()
   ;; Return T if the :ssl module is loaded *and* has the SNI feature.
@@ -738,8 +884,8 @@
   ;; We cannot do this at compile time because :ssl isn't loaded when
   ;; aserve is compiled.  In fact, the test is written so that autoloading
   ;; of :ssl is not triggered.
-  #-(version>= 10 1) nil
-  #+(version>= 10 1)
+  #-(and (not zacl) (version>= 10 1)) nil
+  #+(and (not zacl) (version>= 10 1))
   (let ((sym (find-symbol (symbol-name :*ssl-features*)
 			  (find-package :acl-socket))))
     (when (and sym
@@ -787,6 +933,7 @@
 				 max-depth
 				 connection
 				 use-socket
+                                 cache  ;; client-cache object
 				     
 				 )
   
@@ -802,6 +949,10 @@
   ;;  proxy is set to nil for this call)
   ;;
 
+  (declare (ignorable timeout certificate key certificate-password ca-file 
+		      ca-directory crl-file crl-check verify max-depth 
+                      ssl-method ssl-args))
+  
   
   (if* (and connection (not use-socket))
      then ; try using it
@@ -823,7 +974,7 @@
                                       
             
           
-  (let (host sock port fresh-uri scheme-default-port)
+  (let (host sock port fresh-uri scheme-default-port cookie-string cacheable)
     ;; start a request
     (with-stream-closed-on-failure (sock)
       ;; CONNECT method requests do not require a uri
@@ -891,7 +1042,30 @@
          then ; persistent connection
               (setq sock use-socket)
          else 
-             
+              ;; check to see if it's in the cache first
+              (let ((centry 
+                     (and 
+                      ;; preconditions
+                      cache
+                      (or (eq method :get)
+                          (eq method :head))
+                      (not (or query
+                               basic-authorization
+                               digest-authorization
+                               headers))
+                      
+                      ;; if we get this far the response is cacheable
+                      (setq cacheable t)
+                      
+                      ;; then it's ok to look in the check the cache
+                      (lookup-in-client-cache cache
+                                              uri
+                                              cookies
+                                              accept
+                                              method))))
+                (if* centry
+                   then (return-from make-http-client-request centry)))
+                                                     
               (setq sock
                 (with-socket-connect-timeout (:timeout timeout
                                                        :host host
@@ -999,17 +1173,26 @@
           
        ; some webservers (including AServe) have trouble with put/post
        ; requests without a body
-       (if* (and (not content) (member method '(:put :post)))
+       (if* (and (not content) (member method '(:put :post :patch)))
           then (setf content ""))
-       ; content can be a nil, a single vector or a list of vectors.
-       ; canonicalize..
-       (if* (and content (atom content)) then (setq content (list content)))
+
+       ;; Content can be NIL, a single object or a list. Some objects
+       ;; need to be converted to computed-content objects before processing.
+       (labels ((canonicalize (content-piece)
+                  (typecase content-piece
+                    (pathname
+                     (make-instance 'file-computed-content :filename content-piece))
+                    (stream
+                     (make-instance 'stream-computed-content :stream content-piece))
+                    (otherwise
+                     content-piece))))
+         (setq content (mapcar #'canonicalize (if (listp content) content (list content)))))
         
        (if* content
           then (let ((computed-length 0))
                  (dolist (content-piece content)
                    (typecase content-piece
-                     ((array character (*))
+                     (string
                       (if* (null content-length)
                          then (incf computed-length 
                                     (native-string-sizeof 
@@ -1019,6 +1202,19 @@
                      ((array (unsigned-byte 8) (*)) 
                       (if* (null content-length)
                          then (incf computed-length (length content-piece))))
+                     (computed-content
+                      (let ((content-piece-length (get-content-length content-piece))
+                            (content-piece-headers
+                             (get-content-headers
+                              content-piece :protocol protocol :headers (copy-tree headers))))
+                        (setq headers (append headers content-piece-headers))
+                        (if* (integerp content-piece-length)
+                           then (incf computed-length content-piece-length)
+                           else ;; we can't compute the length so
+                                ;; don't specify any content-length 
+                                ;; unless given explicitly by caller
+                                (setq computed-length nil)
+                                (return))))
                      (t (error "Illegal content array: ~s" content-piece))))
                 
                  (if* (null content-length)
@@ -1031,43 +1227,43 @@
                                        sock "Content-Length: ~s~a" content-length crlf))
       
        (if* cookies 
-           then (let ((str (compute-cookie-string uri
-                                                cookies)))
-                (if* str
-                   then (net.aserve::format-dif :xmit-client-request-headers
-                                                sock "Cookie: ~a~a" str crlf))))
+          then (setq cookie-string (compute-cookie-string uri cookies))
+               (if* cookie-string
+                  then (net.aserve::format-dif 
+                        :xmit-client-request-headers
+                        sock "Cookie: ~a~a" cookie-string crlf)))
 
-        ;; Authorization info can come from three different places: from uri, from basic-authorization or from headers.
-        ;; This code ensures that those three do not disagree with each other and result in equal final authorization hash.
-        ;; It also ensures that authorization information will be written to :xmit-client-request-headers only once.
-        (let* ((userinfo (when (net.uri:uri-userinfo uri) (delimited-string-to-list (net.uri:uri-userinfo uri) #\:)))
-               (uri-auth (make-auth-hash (first userinfo) (or (second userinfo) "")))
-               (basic-auth (make-auth-hash (car basic-authorization) (cdr basic-authorization)))
-               (header-auth (cdr (assoc "Authorization" headers :test #'equalp)))
-               (auth-candidates (remove-duplicates
-                                 (remove nil (list header-auth basic-auth uri-auth))
-                                 :test #'string=))
-               (common-auth (car auth-candidates)))
+       ;; Authorization info can come from three different places: from uri, from basic-authorization or from headers.
+       ;; This code ensures that those three do not disagree with each other and result in equal final authorization hash.
+       ;; It also ensures that authorization information will be written to :xmit-client-request-headers only once.
+       (let* ((userinfo (when (net.uri:uri-userinfo uri) (delimited-string-to-list (net.uri:uri-userinfo uri) #\:)))
+              (uri-auth (make-auth-hash (first userinfo) (or (second userinfo) "")))
+              (basic-auth (make-auth-hash (car basic-authorization) (cdr basic-authorization)))
+              (header-auth (cdr (assoc "Authorization" headers :test #'equalp)))
+              (auth-candidates (remove-duplicates
+                                (remove nil (list header-auth basic-auth uri-auth))
+                                :test #'string=))
+              (common-auth (car auth-candidates)))
     
-          (when (> (length auth-candidates) 1)
-            (error "Multiple conflicting authentication credentials supplied"))
+         (when (> (length auth-candidates) 1)
+           (error "Multiple conflicting authentication credentials supplied"))
 
-          ;; If everything is OK and there is no authorization info in supplied headers - write it.
-          ;; If authorization info is supplied in headers it will be written later when parsing headers.
-          (if* (and (not header-auth)
-                    common-auth)
+         ;; If everything is OK and there is no authorization info in supplied headers - write it.
+         ;; If authorization info is supplied in headers it will be written later when parsing headers.
+         (if* (and (not header-auth)
+                   common-auth)
             then (net.aserve::format-dif :xmit-client-request-headers
                                          sock "Authorization: ~a~a"
                                          common-auth
                                          crlf)))
         
-        (if* proxy-basic-authorization
-           then (net.aserve::format-dif :xmit-client-request-headers
-                                        sock "Proxy-Authorization: ~a~a"
-                                        (make-auth-hash
-                                         (car proxy-basic-authorization)
-                                         (cdr proxy-basic-authorization))
-                                        crlf))
+       (if* proxy-basic-authorization
+          then (net.aserve::format-dif :xmit-client-request-headers
+                                       sock "Proxy-Authorization: ~a~a"
+                                       (make-auth-hash
+                                        (car proxy-basic-authorization)
+                                        (cdr proxy-basic-authorization))
+                                       crlf))
         
        (if* (and digest-authorization
                  (digest-response digest-authorization))
@@ -1141,9 +1337,13 @@
 	  :uri uri
 	  :socket sock
 	  :cookies cookies
+          :cookie-string cookie-string
+          :accept accept
 	  :method method
 	  :return-connection (if* keep-alive then :maybe)
-	  :deferred-content deferred-content)))))
+	  :deferred-content deferred-content
+          :cacheable cacheable
+          )))))
 
 (defun maybe-setup-proxy-tunnel (url &rest args
                                  &key proxy-basic-authorization
@@ -1171,10 +1371,6 @@
   ;   we return nil for the socket as the value of proxy
   ;;  as the proxy so its value won't change
   ;;  
-  
-  (declare (ignorable certificate key certificate-password
-                      ca-file ca-directory crl-file crl-check
-                      verify max-depth ssl-method))
   
   (let* ((uri (net.uri:parse-uri url))
          (host (net.uri:uri-host uri))
@@ -1308,8 +1504,7 @@
 
 (defun uri-path-etc (uri)
   ;; return the string form of the uri path, query and fragment
-  (let ((nuri (net.uri:copy-uri uri)))
-    (setf (net.uri:uri-scheme nuri) nil)
+  (let ((nuri (net.uri:copy-uri uri :scheme nil)))
     (setf (net.uri:uri-host nuri) nil)
     (setf (net.uri:uri-port nuri) nil)
     (setf (net.uri:uri-userinfo nuri) nil)
@@ -1589,7 +1784,13 @@
        then (net.aserve::parse-header-value val)
        else val)))
 
-    
+(defun header-value (headers key)
+  ;; return the value for the given header from a list of header values.
+  ;; A header is named by a keyword symbol
+  ;;
+  (cdr (assoc key headers :test #'eq)))
+  
+
 (defmacro ignore-connection-reset-and-abort (&body body)
   (let ((tag (gensym)))
     `(catch ',tag
@@ -1781,12 +1982,20 @@
   ;;  
   ;;
   ((items :initform nil
-	  :accessor cookie-jar-items)))
+	  :accessor cookie-jar-items)
+   (lock  :initform (mp:make-process-lock)
+          :reader cookie-jar-lock)
+   ))
 
 (defmethod print-object ((jar cookie-jar) stream)
   (print-unreadable-object (jar stream :type t :identity t)
     (format stream "~d cookies" (length (cookie-jar-items jar)))))
 
+(defmacro with-cookie-jar-lock ((cookie-jar) &body body)
+  `(mp:with-process-lock ((cookie-jar-lock ,cookie-jar))
+     ,@body))
+  
+  
 ;* for a given hostname, there will be only one cookie with
 ; a given (path,name) pair
 ;
@@ -1839,7 +2048,7 @@
     
     (if* domain
        then ; one is given, test to see if it's a substring
-	    ; of the host we used
+            ; of the host we used
 	    (if* (null (net.aserve::match-tail-p domain 
 						 (net.uri:uri-host uri)))
 	       then (return-from save-cookie nil))
@@ -1855,43 +2064,44 @@
 		 :http-only (net.aserve::assoc-paramval "httponly" others)
 		 )))
       ; now put in the cookie jar
-      (let ((domain-vals (assoc domain (cookie-jar-items jar) :test #'equal)))
-	(if* (null domain-vals)
-	   then ; this it the first time for this host
-		(push (list domain item) (cookie-jar-items jar))
-	   else ; this isn't the first
-		; check for matching path and name
-		(do* ((xx (cdr domain-vals) (cdr xx))
-		     (thisitem (car xx) (car xx)))
-		    ((null xx)
-		     )
-		  (if* (and (equal (cookie-item-path thisitem)
-				   path)
-			    (equal (cookie-item-name thisitem)
-				   (car namevalue)))
-		     then ; replace this one
-			  (setf (car xx) item)
-			  (return-from save-cookie nil)))
+      (with-cookie-jar-lock (jar)
+        (let ((domain-vals (assoc domain (cookie-jar-items jar) :test #'equal)))
+          (if* (null domain-vals)
+             then ; this it the first time for this host
+                  (push (list domain item) (cookie-jar-items jar))
+             else ; this isn't the first
+                  ; check for matching path and name
+                  (do* ((xx (cdr domain-vals) (cdr xx))
+                        (thisitem (car xx) (car xx)))
+                      ((null xx)
+                       )
+                    (if* (and (equal (cookie-item-path thisitem)
+                                     path)
+                              (equal (cookie-item-name thisitem)
+                                     (car namevalue)))
+                       then ; replace this one
+                            (setf (car xx) item)
+                            (return-from save-cookie nil)))
 		
-		; no match, must insert based on the path length
-		(do* ((prev nil xx)
-		      (xx (cdr domain-vals) (cdr xx))
-		      (thisitem (car xx) (car xx))
-		      (length (length path)))
-		    ((null xx)
-		     ; put at end
-		     (if* (null prev) then (setq prev domain-vals))
-		     (setf (cdr prev) (cons item nil)))
-		  (if* (>= (length (cookie-item-path thisitem)) length)
-		     then ; can insert here
-			  (if* prev
-			     then (setf (cdr prev)
-				    (cons item xx))
+                  ; no match, must insert based on the path length
+                  (do* ((prev nil xx)
+                        (xx (cdr domain-vals) (cdr xx))
+                        (thisitem (car xx) (car xx))
+                        (length (length path)))
+                      ((null xx)
+                       ; put at end
+                       (if* (null prev) then (setq prev domain-vals))
+                       (setf (cdr prev) (cons item nil)))
+                    (if* (>= (length (cookie-item-path thisitem)) length)
+                       then ; can insert here
+                            (if* prev
+                               then (setf (cdr prev)
+                                      (cons item xx))
 				  
-			     else ; at the beginning
-				  (setf (cdr domain-vals)
-				    (cons item (cdr domain-vals))))
-			  (return-from save-cookie nil))))))))
+                               else ; at the beginning
+                                    (setf (cdr domain-vals)
+                                      (cons item (cdr domain-vals))))
+                            (return-from save-cookie nil)))))))))
 		  
       
 
@@ -1907,15 +2117,16 @@
 	res
 	rres)
     
-    (dolist (hostval (cookie-jar-items jar))
-      (if* (net.aserve::match-tail-p (car hostval)
-				     host)
-	 then ; ok for this host
-	      (dolist (item (cdr hostval))
-		(if* (net.aserve::match-head-p (cookie-item-path item)
-					       path)
-		   then ; this one matches
-			(push item res)))))
+    (with-cookie-jar-lock (jar)
+      (dolist (hostval (cookie-jar-items jar))
+        (if* (net.aserve::match-tail-p (car hostval)
+                                       host)
+           then ; ok for this host
+                (dolist (item (cdr hostval))
+                  (if* (net.aserve::match-head-p (cookie-item-path item)
+                                                 path)
+                     then ; this one matches
+                          (push item res))))))
     
     (if* res
        then ; have some cookies to return

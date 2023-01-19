@@ -53,7 +53,7 @@
 (defun free-parseobj (po)
   (smp-case
    ((t :macros)
-    (push-atomic po (si:global-symbol-value '*parseobjs*)))
+    (push-atomic po *parseobjs*))
    (nil
     (mp::without-scheduling ;; in a #-smp form
       (push po *parseobjs*)))))

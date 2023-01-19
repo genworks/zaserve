@@ -17,7 +17,7 @@
 
 ; stream that reads the input and chunks the data to the output
 
-(def-stream-class chunking-stream (single-channel-simple-stream)
+(def-stream-class chunking-stream (single-channel-simple-stream http-stream)
   ((trailers :initform nil :accessor chunking-stream-trailers)
    (eof-sent :initform nil :accessor chunking-stream-eof-sent)))
 
@@ -155,15 +155,19 @@
   nil
   )
 
+#+zlib-deflate
 (defmethod set-trailers ((p deflate-stream) trailers)
   (set-trailers (deflate-target-stream p) trailers))
 
+#+zlib-deflate
 (defmethod can-set-trailers-p ((p deflate-stream))
   (can-set-trailers-p (deflate-target-stream p)))
 
+#+zlib-deflate
 (defmethod excl::socket-bytes-written ((stream deflate-stream) &optional set)
   (excl::socket-bytes-written (deflate-target-stream stream) set))
 
+#+zlib-deflate
 (defmethod excl::socket-bytes-read ((stream deflate-stream) &optional set)
   (excl::socket-bytes-read (deflate-target-stream stream) set))
 
@@ -252,7 +256,7 @@
 ;; unchunker stream returns eof when the end of the chunked data
 ;; is reached however the inner stream is not closed.
 ;;
-(def-stream-class unchunking-stream (single-channel-simple-stream)
+(def-stream-class unchunking-stream (single-channel-simple-stream http-stream)
   ((state :initform :need-count
 	  :accessor unchunking-state)
    (count  :initform 0

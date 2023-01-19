@@ -21,7 +21,7 @@
 #+ignore
 (check-smp-consistency)
 
-(defparameter *aserve-version* '(1 3 65))
+(defparameter *aserve-version* '(1 3 75))
 
 (eval-when (:execute :load-toplevel)
     (require :sock)
@@ -359,11 +359,20 @@ will be logged with one log entry per line in some cases.")
 (defun check-for-open-socket-before-gc (socket)
   (if* (open-stream-p socket)
      then (logmess 
-	   (let ((*print-readably* nil))
+	   (let ((*print-readably* nil)
+                 (socket:*print-hostname-in-stream* nil)
+                 )
 	     ;; explicitly binding *print-readably* nil in order to avoid
 	     ;; a printer crash if the finalization is run in a thread
 	     ;; with, say, with-standard-io-syntax that binds *print-readably*
-	     ;; true.
+             ;; true.
+             ;;
+             ;; bug25695
+             ;; Bind *print-hostname-in-stream* to nil so that we don't
+             ;; invoke acldns which may have been interrupted by this gc
+             ;; while it held a lock that we'll need to acquire to
+             ;; complete the hostname lookup (thus resulting in a deadlock)
+             ;; (see ensure-nameserver-queue-process-started).
 	     (format nil 
 		     "socket ~s is open yet is about to be gc'ed. It will be closed" 
 		     socket)))
@@ -408,6 +417,9 @@ will be logged with one log entry per line in some cases.")
 blocked before we give up and assume the client on the other side has
 died. Use nil to specify no timeout.")
 
+(defvar *http-free-worker-timeout* 3
+  "Number of seconds to wait for a free worker thread.")
+
 ; usually set to the default server object created when aserve is loaded.
 ; users may wish to set or bind this variable to a different server
 ; object so it is the default for publish calls.
@@ -433,6 +445,9 @@ died. Use nil to specify no timeout.")
 (defvar *not-modified-entity*) ; used to send back not-modified message
 
 (defvar-mp *thread-index*  0)      ; globalcounter to gen process names
+;; SBCL need globals to be of type FIXNUM if we are to use atomic
+;; operations on them hence this declaration
+#+sbcl (declaim (type fixnum *thread-index*))
 
 (defvar *log-wserver-name* nil)
 	
@@ -523,7 +538,8 @@ died. Use nil to specify no timeout.")
 
    (vhosts
     ;; map names to vhost objects
-    :initform (make-hash-table :test #'equalp)
+    :initform (make-hash-table :test #'equalp
+			       #+sbcl :synchronized #+sbcl t)
     :accessor wserver-vhosts)
    
    (default-vhost
@@ -551,6 +567,12 @@ died. Use nil to specify no timeout.")
     :initarg :header-read-timeout
     :initform *http-header-read-timeout*
     :accessor wserver-header-read-timeout)
+
+   (free-worker-timeout
+    ;; time to wait for a free worker thread
+    :initform *http-free-worker-timeout*
+    :initarg :free-worker-timeout
+    :accessor wserver-free-worker-timeout)
    
    ;;
    ;; -- internal slots --
@@ -1177,6 +1199,8 @@ by keyword symbols and not by strings"
 ;; 6.3.6.  205 Reset Content
 (defparameter *response-partial-content* (make-resp 206 "Partial Content"))
 ;; 3xx
+(defparameter *response-multiple-choices* 
+    (make-resp 300 "Multiple Choice"))
 (defparameter *response-moved-permanently*
     (make-resp 301 "Moved Permanently"))
 (defparameter *response-found* (make-resp 302 "Found"))
@@ -1198,7 +1222,7 @@ by keyword symbols and not by strings"
 (defparameter *response-proxy-unauthorized* (make-resp 407 "Proxy Authentication Required"))
 (defparameter *response-request-timeout* (make-resp 408 "Request Timeout"))
 (defparameter *response-conflict* (make-resp 409 "Conflict"))
-;; 6.5.9.  410 Gone
+(defparameter *response-gone* (make-resp 410 "Gone"))
 ;; 6.5.10.  411 Length Required
 (defparameter *response-precondition-failed*
     (make-resp 412 "Precondition failed"))
@@ -1300,6 +1324,7 @@ by keyword symbols and not by strings"
 		   (external-format nil efp); to set external format
 		   backlog
 		   (compress (and (member :zlib-deflate *features*) t))
+		   (reuse-socket-address t)
 		   )
   ;; -exported-
   ;;
@@ -1452,7 +1477,7 @@ by keyword symbols and not by strings"
   (let* ((main-socket (socket:make-socket :connect :passive
 					  :local-port port
 					  :local-host host
-					  :reuse-address t
+					  :reuse-address reuse-socket-address
 					  :format :bivalent
 					  :backlog backlog
 					  
@@ -1474,7 +1499,7 @@ by keyword symbols and not by strings"
         ((integer 1 *) keep-alive) ;; positive-int
         (null nil)
         (t (wserver-header-read-timeout server))))
-    (setf (wserver-ssl server) (or ssl (getf ssl-args :certificate)))
+    (setf (wserver-ssl server) (or ssl (getf ssl-args :certificate) (getf ssl-args :context)))
 
     #+unix
     (if* os-processes
@@ -1688,32 +1713,33 @@ by keyword symbols and not by strings"
 	     ;; 8.1.
 	     #+(version>= 8 1)
 	     ((member :zoom-on-error *debug-current* :test #'eq)
-	      (tagbody 
-		(handler-bind
-		    ((error
-		      (lambda (cond)
-			(if* (connection-reset-error cond)
-			   then (go out) ;; don't print these errors,
-			   else (logmess 
-				 (format nil "~agot error ~a~%" 
-					 (if* *worker-request*
-					    then (format 
-						  nil 
-						  "while processing command ~s~%"
-						  (request-raw-request 
-						   *worker-request*))
-					    else "")
-					 cond))
-				(top-level.debug:zoom
-				 (or (vhost-error-stream
-				      (wserver-default-vhost
-				       *wserver*))
-				     *initial-terminal-io*))
-				(if* (not (member :notrap *debug-current*))
+	      (tagbody
+		 (handler-bind
+		     ((error
+		       (lambda (cond)
+			 (if* (connection-reset-error cond)
+			      then (go out) ;; don't print these errors,
+			      else (logmess 
+				    (format nil "~agot error ~a~%" 
+					    (if* *worker-request*
+						 then (format 
+						       nil 
+						       "while processing command ~s~%"
+						       (request-raw-request 
+							*worker-request*))
+						 else "")
+					    cond))
+			      (top-level.debug:zoom
+			       (or (vhost-error-stream
+				    (wserver-default-vhost
+				     *wserver*))
+				   *initial-terminal-io*))
+			      (if* (not (member :notrap *debug-current*))
 				   then ; after the zoom ignore the error
-					(go out))
-				))))
-		  (process-connection sock)) out))
+				   (go out))
+			      ))))
+		   (process-connection sock))
+	       out))
 	     ((not (member :notrap *debug-current* :test #'eq))
 	      (handler-case (process-connection sock)
 		(error (cond)
@@ -1773,8 +1799,7 @@ by keyword symbols and not by strings"
   (let* ((error-count 0)
 	 (server *wserver*)
 	 (main-socket (wserver-socket server))
-	 (ipaddrs (wserver-ipaddrs server))
-	 (busy-sleeps 0))
+	 (ipaddrs (wserver-ipaddrs server)))
     (unwind-protect
 
 	(loop
@@ -1789,11 +1814,7 @@ by keyword symbols and not by strings"
 			 sock 
 			 #'check-for-open-socket-before-gc))
 		
-                                        ; track all the ipaddrs by which we're reachable
-                ;;
-		;; Have to fix IPv6 before the below will work. 
-		;;
-		#+nil
+		; track all the ipaddrs by which we're reachable
 		(if* (not (member (setq localhost (socket:local-host sock))
 				  ipaddrs))
 		   then ; new ip address by which this machine is known
@@ -1817,32 +1838,18 @@ by keyword symbols and not by strings"
 		(setq error-count 0) ; reset count
 	
 		; find a worker thread
-		; keep track of the number of times around the loop looking
-		; for one so we can handle cases where the workers are all busy
-		(let ((looped 0))
-		  (loop
-                    (multiple-value-bind (worker found-worker-p) (dequeue (wserver-free-worker-threads server) :wait 1)
-                      (if* found-worker-p
-                         then (incf-free-workers server -1)
-                              (mp:process-add-run-reason worker sock)
-                              (return)
-                       elseif (below-max-n-workers-p server)
-                         then (case looped
-                                (0 nil)
-                                ((1 2 3) (logmess "all threads busy, pause")
-                                 (if* (>= (incf busy-sleeps) 4)
-                                    then ; we've waited too many times
-                                         (setq busy-sleeps 0)
-                                         (logmess "too many sleeps, will create a new thread")
-                                         (make-worker-thread)))
-                                (4
-                                 (logmess "forced to create new thread")
-                                 (make-worker-thread))
-                                (5
-                                 (logmess "can't even create new thread, quitting")
-                                 (return-from http-accept-thread nil)))
-                         else (logmess "all threads busy, pause"))
-                      (incf looped)))))
+                (loop
+                  (multiple-value-bind (worker found-worker-p)
+                      (dequeue (wserver-free-worker-threads server)
+                               :wait (wserver-free-worker-timeout server))
+                    (if* found-worker-p
+                       then (incf-free-workers server -1)
+                            (mp:process-add-run-reason worker sock)
+                            (return)
+                     elseif (below-max-n-workers-p server)
+                       then (logmess "creating new thread")
+                            (make-worker-thread)
+                       else (logmess "all threads busy, pause")))))
 	  
 	    (error (cond)
 	      (logmess (format nil "accept: error ~s on accept ~a" 
@@ -1897,82 +1904,103 @@ by keyword symbols and not by strings"
   ;;
   
   (unwind-protect
-      (let ((header-read-timeout (wserver-header-read-timeout *wserver*))
-            req error-obj error-response (chars-seen (list nil)))
+       (handler-bind
+	   ((stream-error #'(lambda (err)
+			      (let ((stream (stream-error-stream err)))
+				(when (eq stream #-zacl sock
+						 #+zacl (zacl::real-stream sock))
+				  (return-from process-connection nil)))))
+	    (cl+ssl::ssl-error
+	      ;; SSL errors vastly represent failures in establishing a secure
+	      ;; connection, therefore they can be ignored in this case, since
+	      ;; we are neither interested in establishing unsecure connections,
+	      ;; nor in keeping a worker thread blocked in a debugger.
+	      (lambda (error)
+		(logmess
+		 (format nil "While reading http request~:_ from ~a:~:_ ~a"
+			 (socket:ipaddr-to-dotted
+			  (socket::remote-host sock))
+			 (substitute #\SPACE #\NEWLINE
+				     (princ-to-string error)))
+		 :brief)
+		(return-from process-connection nil))))
+	 (let ((header-read-timeout (wserver-header-read-timeout *wserver*))
+	       req error-obj error-response (chars-seen (list nil)))
             
 
-	;; run the accept hook on the socket if there is one
-	(let ((ahook (wserver-accept-hook *wserver*)))
-	  (if* ahook then (setq sock (funcall ahook sock))))
+	   ;; run the accept hook on the socket if there is one
+	   (let ((ahook (wserver-accept-hook *wserver*)))
+	     (if* ahook then (setq sock (funcall ahook sock))))
 	
-	;; get first command
-	(loop
-	  (multiple-value-setq (req error-obj error-response)
-	    (ignore-errors
-	     (mp:with-timeout (header-read-timeout
-			       (debug-format :info "total header read timeout")
-			       (values nil nil *response-request-timeout*))
+	   ;; get first command
+	   (loop
+	     (multiple-value-setq (req error-obj error-response)
+	       (ignore-errors
+		(mp:with-timeout (header-read-timeout
+				   (debug-format :info "total header read timeout")
+				   (values nil nil *response-request-timeout*))
 			     
-	       (with-timeout-local ((wserver-read-request-timeout *wserver*)
-				    (debug-format :info "request timed out on read")
-				    (values nil nil *response-request-timeout*))
-		 (read-http-request sock chars-seen)))))
+		  (with-timeout-local ((wserver-read-request-timeout *wserver*)
+				       (debug-format :info "request timed out on read")
+				       (values nil nil *response-request-timeout*))
+		    (read-http-request sock chars-seen)))))
 	  
-	  (if* (null req)
-	     then ; end of file, means do nothing
-		  ; (logmess "eof when reading request")
-		  ; end this connection by closing socket
-		  (if* error-obj
-		     then (logmess 
-			   (format nil "While reading http request~:_ from ~a:~:_ ~a" 
-				   (socket:ipaddr-to-dotted 
-				    (socket::remote-host sock))
-				   error-obj)
-                           :brief))
+	     (if* (null req)
+		then
+		    ;; end of file, means do nothing
+		    ;; (logmess "eof when reading request")
+		    ;; end this connection by closing socket
+		    (if* error-obj
+		       then (logmess 
+			     (format nil "While reading http request~:_ from ~a:~:_ ~a" 
+					 (socket:ipaddr-to-dotted 
+					  (socket::remote-host sock))
+					 error-obj)
+			     :brief))
 
-		  ; notify the client if it's still listening
-		  (if* (car chars-seen)
-		     then (ignore-errors
-			   (let ((code (or error-response *response-bad-request*)))
-			     (format sock "HTTP/1.0 ~d  ~a~aContent-Length: 0~aConnection: close~a~a"
-				     (response-number code)
-				     (response-desc code)
-				     *crlf* *crlf* *crlf* *crlf*))
-			   (force-output sock)))
+		    ;; notify the client if it's still listening
+		    (if* (car chars-seen)
+		       then (ignore-errors
+			     (let ((code (or error-response *response-bad-request*)))
+			       (format sock "HTTP/1.0 ~d  ~a~aContent-Length: 0~aConnection: close~a~a"
+				       (response-number code)
+				       (response-desc code)
+				       *crlf* *crlf* *crlf* *crlf*))
+			     (force-output sock)))
 		   
-		  (return-from process-connection nil)
-	     else ;; got a request
-		  (setq *worker-request* req) 
+		    (return-from process-connection nil)
+		else ;; got a request
+		     (setq *worker-request* req) 
 		  
-		  (setf (request-request-date req) (get-universal-time))
-                  (setf (request-request-microtime req) (get-micro-real-time))
+		     (setf (request-request-date req) (get-universal-time))
+                     (setf (request-request-microtime req) (get-micro-real-time))
 
-		  (handle-request req)
-		  (setf (request-reply-date req) (get-universal-time))
-                  (setf (request-reply-microtime req) (get-micro-real-time))
+		     (handle-request req)
+		     (setf (request-reply-date req) (get-universal-time))
+                     (setf (request-reply-microtime req) (get-micro-real-time))
 		  
-		  (force-output-noblock (request-socket req))
+		     (force-output-noblock (request-socket req))
 
-                  (log-request req)
+                     (log-request req)
 		  
-		  (setq *worker-request* nil)
-		  (free-req-header-block req)
+		     (setq *worker-request* nil)
+		     (free-req-header-block req)
 		  
-                  (let ((sock (request-socket req)))
-                    (if* (member :keep-alive
-                                 (request-reply-strategy req)
-                                 :test #'eq)
-                       then ;; continue to use it
-                            ;; For keep-alive sockets the header-read-timeout is now governed by
-                            ;; keep-alive timeout. Update the header-read-timeout so the timeout
-                            ;; timers are set properly for the next pass through the loop.
-                            (setf header-read-timeout (wserver-keep-alive-timeout *wserver*))
-                            (debug-format :info "request over, keep socket alive with timeout of ~d"
-                                          header-read-timeout)
-                            (force-output-noblock sock)
-                            (setf (car chars-seen) nil) ; for next use
-                            (excl::socket-bytes-written (request-socket req) 0)
-                       else (return))))))
+                     (let ((sock (request-socket req)))
+		       (if* (member :keep-alive
+                                    (request-reply-strategy req)
+                                    :test #'eq)
+			  then ;; continue to use it
+			       ;; For keep-alive sockets the header-read-timeout is now governed by
+			       ;; keep-alive timeout. Update the header-read-timeout so the timeout
+			       ;; timers are set properly for the next pass through the loop.
+			       (setf header-read-timeout (wserver-keep-alive-timeout *wserver*))
+			       (debug-format :info "request over, keep socket alive with timeout of ~d"
+						   header-read-timeout)
+			       (force-output-noblock sock)
+			       (setf (car chars-seen) nil) ; for next use
+			       (excl::socket-bytes-written (request-socket req) 0)
+			  else (return)))))))
     ;; do it in two stages since each one could error and both have
     ;; to be attempted
     (ignore-errors (force-output-noblock sock))
@@ -2046,7 +2074,7 @@ by keyword symbols and not by strings"
 	    
 	    (setq req (make-instance 'http-request
 			:method cmd
-			:uri (net.uri:copy-uri uri)
+			:uri (net.uri:copy-uri uri :scheme (if (wserver-ssl *wserver*) :https :http))
 								 
 			:raw-uri uri
 			:decoded-uri-path
@@ -2090,11 +2118,6 @@ by keyword symbols and not by strings"
 				(if* port
 				   then (setf (uri-port uri) port)))
 			
-			(setf (uri-scheme uri) 
-			  (if* (wserver-ssl *wserver*)
-			     then :https
-			     else :http))
-			
 			;; set virtual host in the request
 			(let ((vhost 
 			       (gethash host (wserver-vhosts *wserver*))))
@@ -2111,23 +2134,13 @@ by keyword symbols and not by strings"
       (if* buffer then (free-request-buffer buffer)))))
 
 
-				      
-    
-		    
-      
-   
-    
-    
-    
-
-
-
 
 (defvar *http-command-list*
     '(("GET " . :get)
       ("HEAD " . :head)
       ("POST " . :post)
       ("PUT "  . :put)
+      ("PATCH "  . :patch)
       ("OPTIONS " . :options)
       ("DELETE " .  :delete)
       ("TRACE "  .  :trace)
@@ -2159,6 +2172,11 @@ by keyword symbols and not by strings"
 	      :external-format external-format))
        else result)))
 
+(defmethod get-request-body :around ((req http-request)
+				     &key (external-format :octets ef-supplied))
+  (declare (ignore req external-format ef-supplied))
+  (or (call-next-method) ""))
+
 (defun get-request-body-retrieve-and-maybe-log (req)
   (let ((body (get-request-body-retrieve req)))
     (debug-format :xmit-server-request-body "~s" body)
@@ -2189,7 +2207,7 @@ by keyword symbols and not by strings"
 	    (header-slot-value-integer req :content-length))
     
 	  ;; Send  Continue status if requested, regardless of body indicators.
-	  (when (member (request-method req) '(:put :post))
+	  (when (member (request-method req) '(:put :post :patch))
 	    (when (request-has-continue-expectation req)
 	      (send-100-continue req)))
 
@@ -2254,7 +2272,7 @@ by keyword symbols and not by strings"
 	   elseif (keep-alive-specified req)
 	     then ;; must be no body
 		  ""
-	   elseif (member (request-method req) '(:put :post))					
+	   elseif (member (request-method req) '(:put :post :patch))
 	     then ;; read until the end of file to collect an implied body
 		  (with-timeout-local
 		      ((wserver-read-request-body-timeout *wserver*) 
@@ -2391,14 +2409,14 @@ by keyword symbols and not by strings"
 			       else (setf (ausb8 buffer index)
 				      (char-code ch))
 				    (if* (>= (incf index) buffsize)
-				       then (funcall function buffsize)
+				       then (funcall function buffer buffsize)
 					    (setq index 0))))))
 		  ;; no content length given
 	   elseif (keep-alive-specified req)
 	     then ;; must be no body
 		  (funcall function nil 0)
 		  
-	   elseif (member (request-method req) '(:put :post))
+	   elseif (member (request-method req) '(:put :post :patch))
 	     then ;; read until the end of file to collect implied body
 		  (with-timeout-local
 		      ((wserver-read-request-body-timeout *wserver*) 
@@ -2574,7 +2592,7 @@ by keyword symbols and not by strings"
 	  (dolist (ent (svref ans i))
 	    (push (cons (svref *header-keyword-array* i)
 			(parse-header-value
-			 (buffer-subseq-to-string buffer (car ent) (cdr ent))))
+			 (buffer-subseq-to-string buffer (car ent) (cdr ent) :utf-8)))
 		  headers)))
 	(free-sresource *header-index-sresource* ans))
       
@@ -3157,7 +3175,7 @@ in get-multipart-sequence"))
 				   :external-format external-format)))))
 	      
       (if* post
-	 then (if* (and (member (request-method req) '(:post :put))
+	 then (if* (and (member (request-method req) '(:post :put :patch))
 			(search ; sometimes other stuff added we can ignore
 			 "application/x-www-form-urlencoded"
 			 (header-slot-value req :content-type))
@@ -3386,65 +3404,88 @@ in get-multipart-sequence"))
 
 
 ;; ----- simple resource
+;; Motivation for using private resource functions is discussed in rfe15865.
 
 (defstruct sresource
-  data	 ; list of buffers
+  name   
+  data	 ; list of buffers or (nil . buffers)
   create ; create new object for the buffer
   init	 ; optional - used to init buffers taken off the free list
-  (lock  (mp:make-process-lock))
+  lock   ; When set to process-lock, size can be specified in get call.
   )
 
-(defun create-sresource (&key create init)
-  (make-sresource :create create :init init))
+(defun create-sresource (&key create init 
+			      (name (gensym (string :asres)))
+			      (one-size (error "ONE_SIZE argument is required."))
+			 &aux
+			 (new (make-sresource :name name :create create :init init)))
+  (if one-size
+      ;; For fixed size resource, make the data slot a list
+      ;;  that can be modified with atomic push and pop.
+      (setf (sresource-data new) (list nil))
+    ;; If size can vary, we have to use a lock;
+    ;;  data can be a simple list.
+    (setf (sresource-lock new) (mp:make-process-lock :name name)))
+  new)
 
-(defun get-sresource (sresource &optional size)
+(defun get-sresource (sresource &optional size 
+		      &aux to-return 
+			   (lock (sresource-lock sresource)))
   ;; get a new resource. If size is given then ask for at least that
   ;; size
-  (let (to-return)
-    ;; force new ones to be allocated
-    (mp:with-process-lock ((sresource-lock sresource))
-      (let ((buffers (sresource-data sresource)))
-	(if* size
-	   then ; must get one of at least a certain size
-		(dolist (buf buffers)
-		  (if* (>= (length buf) size)
-		     then (setf (sresource-data sresource)
-			    (delete buf buffers :test #'eq))
-			  (setq to-return buf)
-			  (return)))
+  (when (and size (null lock))
+    (error "Size cannot be specified for sresource ~A" (sresource-name sresource)))
+  
+  
+  ;; force new ones to be allocated
+  (if lock
+      (mp:with-process-lock (lock)
+	(let ((buffers (sresource-data sresource)))
+	  (if* size
+	     then ;; must get one of at least a certain size
+		  (dolist (buf buffers)
+		    (if* (>= (length buf) size)
+		       then (setf (sresource-data sresource)
+			      (delete buf buffers :test #'eq))
+			    (setq to-return buf)
+			    (return)))
 	    
-		; none big enough
+		  ;; none big enough
 	      
-	   else ; just get any buffer
-		(if* buffers
-		   then (setf (sresource-data sresource) (cdr buffers))
-			(setq to-return (car buffers)))
+	     else ;; just get any buffer
+		  (if* buffers
+		     then (setf (sresource-data sresource) (cdr buffers))
+			  (setq to-return (car buffers)))
 		
-		)))
+		  )))
+    (setq to-return (pop-atomic (cdr (sresource-data sresource)))))
   
-    (if* to-return
-       then ; found one to return, must init
+  (if* to-return
+     then ;; found one to return, must init
 	    
-	    (let ((init (sresource-init sresource)))
-	      (if* init
-		 then (funcall init sresource to-return)))
-	    to-return
-       else ; none big enough, so get a new buffer.
-	    (funcall (sresource-create sresource)
-		     sresource
-		     size))))
+	  (let ((init (sresource-init sresource)))
+	    (if* init
+	       then (funcall init sresource to-return)))
+	  to-return
+     else ;; none big enough, so get a new buffer.
+	  (funcall (sresource-create sresource)
+		   sresource
+		   size)))
   
-(defun free-sresource (sresource buffer)
+(defun free-sresource (sresource buffer &aux (lock (sresource-lock sresource)))
   ;; return a resource to the pool
   ;; we silently ignore nil being passed in as a buffer
-  (if* buffer 
-     then (mp:with-process-lock ((sresource-lock sresource))
-	    ;; if debugging
-	    (if* (member buffer (sresource-data sresource) :test #'eq)
-	       then (error "freeing freed buffer"))
-	    ;;
+  (when buffer 
+    (if lock
+	(mp:with-process-lock (lock)
+	  ;; if debugging
+	  (if* (member buffer (sresource-data sresource) :test #'eq)
+	     then (error "freeing freed buffer from ~A" (sresource-name sresource)))
+	  ;;
 	    
-	    (push buffer (sresource-data sresource)))))
+	  (push buffer (sresource-data sresource)))
+      (push-atomic buffer (cdr (sresource-data sresource)))))
+  nil)
 
 
 
@@ -3453,10 +3494,12 @@ in get-multipart-sequence"))
 
 (defparameter *request-buffer-sresource* 
     (create-sresource 
+     :one-size nil
+     :name "request-buffer"
      :create #'(lambda (sresource &optional size)
-			  (declare (ignore sresource))
-			  (make-array (or size 2048)
-				      :element-type 'character))))
+		 (declare (ignore sresource))
+		 (make-array (or size 2048)
+			     :element-type 'character))))
 
 (defun get-request-buffer (&optional size)
   (get-sresource *request-buffer-sresource* size))
@@ -3539,10 +3582,11 @@ in get-multipart-sequence"))
 		       then (values (car parts) port))))))
 
 ;------
+
 (defun get-micro-real-time ()
   (multiple-value-bind (secs usecs) (excl::acl-internal-real-time)
     (+ (* 1000000 (- secs excl::base-for-internal-real-time))
-	 usecs)))
+       usecs)))
       
 ;-------
 
@@ -3759,7 +3803,7 @@ in get-multipart-sequence"))
         (when external-format (find-external-format external-format :errorp nil))
 	(find-external-format *default-aserve-external-format*))))
 
-(def-stream-class truncated-stream (terminal-simple-stream)
+(def-stream-class truncated-stream (terminal-simple-stream http-stream)
   ((remaining :initarg :byte-length :accessor octets-remaining)))
 
 ;; Mention class in make-instance after class def to avoid bug24329.

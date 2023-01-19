@@ -1,23 +1,18 @@
 ;;; ASD file contributed by james anderson <james.anderson@setf.de>
-;;; Updated for zaserve/zacl fork by Dave Cooper <dave+gendl@genworks.com>
 (in-package :cl-user)
 
+(defvar *loadswitch* :compile-if-needed)
+(defparameter *aserve-root* (directory-namestring *load-pathname*))
+
 
 #+allegro
-(defpackage #:acl-reader (:export #:cl-file))
-
-#+allegro
-(defclass acl-reader:cl-file (asdf:cl-source-file)
-  ((type :initform "cl")))
-
-#+allegro
-(asdf:defsystem
- :zaserve
- :author "John K. Foderaro"
- :licence "LLGPL"
- :description "Trivial shim to load built-in aserve when running on Allegro CL" 
- :components ((acl-reader:cl-file "require-builtin-aserve")))
-
+(asdf:defsystem :zaserve
+    :name "AllegroServe (portable)"
+    :author "John K. Foderaro"
+    :version "1.3.65"
+    :licence "LLGPL"
+    :default-component-class cl-source-file.cl
+    :components ((:cl-file "require-original-aserve")))
 
 
 #-allegro
@@ -29,10 +24,9 @@
 SORRY:
 =====
 
-This version of AllegroServe, is not currently supported on ~a. Please
-consider contributing, or requesting, a port of zacl for ~a.
-
-For the legacy PortableAllegroserve, please try system name `paserve'.
+This version of AllegroServe, which uses the `zacl' compatibility
+layer (instead of this old acl-compat), is not currently supported on
+~a. Please consider contributing, or requesting, a port of zacl for ~a.
 
 
 "
@@ -44,13 +38,12 @@ For the legacy PortableAllegroserve, please try system name `paserve'.
 #-allegro
 (asdf:defsystem
  :zaserve
- :author "John K. Foderaro"
- :licence "LLGPL"
- :description "Lightly modified fork of original AllegroServe for portability" 
  :depends-on (:zacl)
  :defsystem-depends-on (:zacl)
  :version "1.3.65"
  :name "AllegroServe"
+ :author "John K. Foderaro"
+ :licence "LLGPL"
  :components
  ;; this list is in load.cl as well... keep in sync
  ((:module "htmlgen" :components ((zacl-reader:cl-file "htmlgen")
@@ -65,6 +58,7 @@ For the legacy PortableAllegroserve, please try system name `paserve'.
   (zacl-reader:cl-file "publish")
   (zacl-reader:cl-file "authorize")
   (zacl-reader:cl-file "log" )
+  (zacl-reader:cl-file "cache")
   (zacl-reader:cl-file "client")
   (zacl-reader:cl-file "proxy")
   (zacl-reader:cl-file "cgi")

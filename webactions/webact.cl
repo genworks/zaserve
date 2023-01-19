@@ -58,7 +58,8 @@
 	 :initform nil
 	 :accessor webaction-map)
    
-   (hash :initform (make-hash-table :test #'equal)
+   (hash :initform (make-hash-table :test #'equal
+				    #+sbcl :synchronized #+sbcl t)
 	 :reader webaction-hash)
 
    ; list of actions triggered by a prefix
@@ -88,9 +89,10 @@
     :initform nil :accessor webaction-session-cookie-only)
    ))
 
-(defparameter *webactions-version* "1.18")
+(defparameter *webactions-version* "1.21")
 	      
-(defvar *name-to-webaction* (make-hash-table :test #'equal))
+(defvar *name-to-webaction* (make-hash-table :test #'equal
+					     #+sbcl :synchronized #+sbcl t))
 
 (defparameter *session-reap-interval* (* 5 60)) ; 5 minutes
 
@@ -627,7 +629,7 @@ no map for webaction with default-actions ~s"
       ; mentioned
       (let ((realname (compute-symname-as-filename req ent wa)))
 	(if* (and realname 
-		  (probe-file realname))
+		  (safe-probe-file realname))
 	   then nil 	; means no actions
 	   else ; look for prefixes
       
@@ -748,3 +750,8 @@ no map for webaction with default-actions ~s"
 
 	       
 	       
+(defun safe-probe-file (file)
+  ;; If the syntax of the file is illegal we don't want
+  ;; this to signal an error, instead returning nil
+  ;; since certainly this file can't exist
+  (ignore-errors (probe-file file)))
