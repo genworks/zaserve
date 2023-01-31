@@ -4,15 +4,21 @@
 (defvar *loadswitch* :compile-if-needed)
 (defparameter *aserve-root* (directory-namestring *load-pathname*))
 
+#+allegro
+(defpackage #:acl-reader (:export #:cl-file))
+
+#+allegro
+(defclass acl-reader:cl-file (asdf:cl-source-file)
+  ((type :initform "cl")))
 
 #+allegro
 (asdf:defsystem :zaserve
-    :name "AllegroServe (portable)"
-    :author "John K. Foderaro"
-    :version "1.3.65"
-    :licence "LLGPL"
-    :default-component-class cl-source-file.cl
-    :components ((:cl-file "require-original-aserve")))
+    :name "AllegroServe (portable)"    
+  :author "John K. Foderaro"
+  :version "1.3.65"
+  :licence "LLGPL"
+  :description "Trivial shim to load built-in aserve when running on Allegro CL" 
+  :components ((acl-reader:cl-file "require-original-aserve")))
 
 
 #-allegro
