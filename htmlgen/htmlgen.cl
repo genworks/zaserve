@@ -116,7 +116,8 @@
 	    (form (car xforms) (car xforms)))
 	  ((null xforms))
 
-	(setq form (macroexpand form env  #+(version>= 7 0) t))
+	;;(setq form (macroexpand form env  #+(and allegro (version>= 7 0)) t))
+        (setq form (macroexpand form env))
 	
 	(if* (atom form)
 	   then (if* (keywordp form)
