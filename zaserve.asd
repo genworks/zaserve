@@ -24,7 +24,8 @@
 #-allegro
 (defun check-platform-compatibilty ()
   (unless (or (member :ccl *features*)
-	      (member :sbcl *features*))
+	      (member :sbcl *features*)
+	      (member :egcl *features*))
     (error "
 
 SORRY:
