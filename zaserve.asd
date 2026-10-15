@@ -51,6 +51,9 @@ layer (instead of this old acl-compat), is not currently supported on
  :name "AllegroServe"
  :author "John K. Foderaro"
  :licence "LLGPL"
+ :description "AllegroServe, the HTTP/1.1 server, client, HTML generator and
+ proxy from Franz, running on Clozure CL, SBCL and Evergreen Common Lisp
+ through the zacl compatibility layer."
  :components
  ;; this list is in load.cl as well... keep in sync
  ((:module "htmlgen" :components ((zacl-reader:cl-file "htmlgen")
