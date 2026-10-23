@@ -884,7 +884,13 @@ headers")
   ;; We cannot do this at compile time because :ssl isn't loaded when
   ;; aserve is compiled.  In fact, the test is written so that autoloading
   ;; of :ssl is not triggered.
-  #-(and (not zacl) (version>= 10 1)) nil
+  ;;
+  ;; zacl's make-ssl-client-stream hands :server-name to cl+ssl, which
+  ;; sends it as the SNI host name.  Answering NIL there left every https
+  ;; request without SNI, and hosts that need it (most behind a CDN)
+  ;; refused the handshake.
+  #+zacl t
+  #+(and (not zacl) (not (version>= 10 1))) nil
   #+(and (not zacl) (version>= 10 1))
   (let ((sym (find-symbol (symbol-name :*ssl-features*)
 			  (find-package :acl-socket))))
