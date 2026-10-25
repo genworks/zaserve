@@ -1195,10 +1195,10 @@ cached connection = ~s~%" cond cached-connection))
     (setf (wserver-pcache server)
       (setq pcache (make-pcache 
 		    :table (make-hash-table :size 1000 :test #'equal
-					    #+sbcl :synchronized #+sbcl t)
+					    #+(or sbcl dotcl) :synchronized #+(or sbcl dotcl) t)
 		    :queueobj (make-and-init-queueobj)
 		    :uri-info-table (make-hash-table :test #'equalp
-						     #+sbcl :synchronized #+sbcl t)
+						     #+(or sbcl dotcl) :synchronized #+(or sbcl dotcl) t)
 		    )))
     
     (configure-memory-cache :server server :size size)
@@ -2917,7 +2917,7 @@ cached connection = ~s~%" cond cached-connection))
     
     ; rebuild the hash table
     (let ((table (make-hash-table :size 1000 :test #'equal
-				  #+sbcl :synchronized #+sbcl t)))
+				  #+(or sbcl dotcl) :synchronized #+(or sbcl dotcl) t)))
       (flet ((process-queue (table queueobj)
 	       ;; add all entries to the hash table
 	       (let ((lru-head (queueobj-lru queueobj))

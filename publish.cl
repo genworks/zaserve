@@ -252,7 +252,7 @@
   ;; the table slot holds the hash table that's used
   ()
   (:default-initargs :info (make-hash-table :test #'equal
-					    #+sbcl :synchronized #+sbcl t)))
+					    #+(or sbcl dotcl) :synchronized #+(or sbcl dotcl) t)))
 
 ;; Mention class in make-instance after class def to avoid bug24329.
 (defun make-instance-locator-exact+name (name)
@@ -605,7 +605,7 @@
 (defun build-mime-types-table ()
   (if* (null *mime-types*)
      then (setf *mime-types* (make-hash-table :test #'equalp
-					      #+sbcl :synchronized #+sbcl t))
+					      #+(or sbcl dotcl) :synchronized #+(or sbcl dotcl) t))
 	  (dolist (ent *file-type-to-mime-type*)
 	    (dolist (type (cdr ent))
 	      (setf (gethash type *mime-types*) (car ent))))))

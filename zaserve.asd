@@ -25,7 +25,8 @@
 (defun check-platform-compatibilty ()
   (unless (or (member :ccl *features*)
 	      (member :sbcl *features*)
-	      (member :egcl *features*))
+	      (member :egcl *features*)
+	      (member :dotcl *features*))
     (error "
 
 SORRY:
