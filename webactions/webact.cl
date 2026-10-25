@@ -59,7 +59,7 @@
 	 :accessor webaction-map)
    
    (hash :initform (make-hash-table :test #'equal
-				    #+sbcl :synchronized #+sbcl t)
+				    #+(or sbcl dotcl) :synchronized #+(or sbcl dotcl) t)
 	 :reader webaction-hash)
 
    ; list of actions triggered by a prefix
@@ -92,7 +92,7 @@
 (defparameter *webactions-version* "1.21")
 	      
 (defvar *name-to-webaction* (make-hash-table :test #'equal
-					     #+sbcl :synchronized #+sbcl t))
+					     #+(or sbcl dotcl) :synchronized #+(or sbcl dotcl) t))
 
 (defparameter *session-reap-interval* (* 5 60)) ; 5 minutes
 

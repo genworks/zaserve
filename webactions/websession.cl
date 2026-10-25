@@ -41,7 +41,7 @@
 		:reader sm-cookie-name)
    
    (websessions  :initform (make-hash-table :test #'equal
-					    #+sbcl :synchronized #+sbcl t)
+					    #+(or sbcl dotcl) :synchronized #+(or sbcl dotcl) t)
 		 :reader sm-websessions)))
 
 ;; Mention class in make-instance after class def to avoid bug24329.
