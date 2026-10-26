@@ -3083,6 +3083,15 @@ in get-multipart-sequence"))
     
       
 
+(defvar *max-request-line-length* 32768
+  ;; the longest request line or header line read-sock-line will
+  ;; accept, in characters.  A longer one is refused as soon as it
+  ;; passes this length (the buffer freed, nil returned, as for eof),
+  ;; so one connection cannot make a worker allocate without limit
+  ;; before any handler sees the request.  nil means no limit.
+  ;; (Genworks, 2026-10-18; sent upstream to Franz.)
+  )
+
 (defun read-sock-line (sock buffer start chars-seen)
   (declare (optimize (speed 3))
 	   (type fixnum start)
@@ -3114,10 +3123,33 @@ in get-multipart-sequence"))
 	   then (if* (eq prevch #\return)
 		   then (decf start) ; back up to toss out return
 			)
+		(if* (>= start max)
+		   then ; no room left for the terminator: a line whose
+			; content exactly filled the buffer and that ended
+			; in a bare LF.  Writing the null at start here
+			; would store one past the end of the array, which
+			; nothing checks at speed 3.  Grow as for a
+			; character.  (Genworks, 2026-10-18.)
+			(let ((new-buffer (get-request-buffer (* max 2))))
+			  (if* (null new-buffer)
+			     then (free-request-buffer buffer)
+				  (return-from read-sock-line nil)
+			     else (dotimes (i start)
+				    (setf (schar new-buffer i)
+				      (schar buffer i)))
+				  (setq max (length new-buffer))
+				  (free-request-buffer buffer)
+				  (setq buffer new-buffer))))
 		(setf (schar buffer start) #\null) ; null terminate
 
 		(return-from read-sock-line (values buffer start))
 	   else ; store character
+		(if* (and *max-request-line-length*
+			  (>= start *max-request-line-length*))
+		   then ; line too long: refuse it
+			(debug-format :info "request line too long")
+			(free-request-buffer buffer)
+			(return-from read-sock-line nil))
 		(if* (>= start max)
 		   then ; must grow the string
 			(let ((new-buffer (get-request-buffer (* max 2))))
