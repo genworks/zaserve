@@ -3,8 +3,8 @@
 The portable fork of AllegroServe for use with ZACL (the ASDF system name
 is "zaserve").  Its home is https://gitlab.common-lisp.net/dcooper/zaserve,
 mirrored to https://github.com/genworks/zaserve; it runs on Clozure CL,
-SBCL and Evergreen Common Lisp (EGCL) through zacl, and on Allegro CL as a
-shim over the built-in AllegroServe.
+SBCL, ECL, Evergreen Common Lisp (EGCL) and dotcl through zacl, and on
+Allegro CL as a shim over the built-in AllegroServe.
 
 
 

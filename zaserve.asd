@@ -31,7 +31,8 @@
   (unless (or (member :ccl *features*)
 	      (member :sbcl *features*)
 	      (member :egcl *features*)
-	      (member :dotcl *features*))
+	      (member :dotcl *features*)
+	      (member :ecl *features*))
     (error "
 
 SORRY:
@@ -58,8 +59,8 @@ layer (instead of this old acl-compat), is not currently supported on
  :author "John K. Foderaro"
  :licence "LLGPL"
  :description "AllegroServe, the HTTP/1.1 server, client, HTML generator and
- proxy from Franz, running on Clozure CL, SBCL and Evergreen Common Lisp
- through the zacl compatibility layer."
+ proxy from Franz, running on Clozure CL, SBCL, ECL, Evergreen Common Lisp
+ and dotcl through the zacl compatibility layer."
  :components
  ;; this list is in load.cl as well... keep in sync
  ((:module "htmlgen" :components ((zacl-reader:cl-file "htmlgen")
