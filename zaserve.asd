@@ -32,7 +32,8 @@
 	      (member :sbcl *features*)
 	      (member :egcl *features*)
 	      (member :dotcl *features*)
-	      (member :ecl *features*))
+	      (member :ecl *features*)
+	      (member :abcl *features*))
     (error "
 
 SORRY:
@@ -47,7 +48,13 @@ layer (instead of this old acl-compat), is not currently supported on
 	   (lisp-implementation-type) (lisp-implementation-type))))
 
 #-(or zacl allegro)
-(defpackage :zacl-reader (:export #:cl-file))
+;; zacl's own definition of this package, word for word (zacl
+;; package.lisp): ABCL's DEFPACKAGE does not add a :USE or an :EXPORT
+;; to a package that exists, so a shorter one made here first would
+;; stand when zacl then loads.
+(defpackage :zacl-reader
+  (:use #:cl)
+  (:export #:*allegro-rewriting-readtable* #:cl-file))
 
 #-allegro
 (asdf:defsystem
