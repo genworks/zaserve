@@ -19,11 +19,14 @@
   :licence "LLGPL"
   :description "Trivial shim to load built-in aserve when running on Allegro CL" 
   ;; read-sock-line-fix: the built-in aserve's request-line reader with
-  ;; the 2026-10-18 overrun fix and line cap (see that file); on the
-  ;; other hosts the same fix is in main.cl.
+  ;; the 2026-10-18 overrun fix and line cap (see that file);
+  ;; request-body-fix: the 2026-11-04 limit on a held body, and workers
+  ;; that outlive a storage-condition.  On the other hosts the same fixes
+  ;; are in main.cl and publish.cl.
   :serial t
   :components ((acl-reader:cl-file "require-original-aserve")
-               (acl-reader:cl-file "read-sock-line-fix")))
+               (acl-reader:cl-file "read-sock-line-fix")
+               (acl-reader:cl-file "request-body-fix")))
 
 
 #-allegro
