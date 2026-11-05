@@ -2684,6 +2684,16 @@
 
 	    
 
+(defmethod compute-strategy :around ((req http-request) (ent entity) format)
+  ;; a body too long to hold is not read, so the connection cannot be
+  ;; kept: its bytes are still in the way of the next request
+  (declare (ignore format))
+  (let ((strategy (call-next-method)))
+    (if* (request-body-refused-p req)
+       then (setf (request-reply-strategy req)
+	      (remove :keep-alive strategy :test #'eq))
+       else strategy)))
+
 (defmethod compute-strategy :around ((req http-request) (ent computed-entity) format)
   (declare (ignore format))
   

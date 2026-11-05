@@ -405,6 +405,28 @@ will be logged with one log entry per line in some cases.")
 
 (defvar *read-request-timeout* 20)
 (defvar *read-request-body-timeout* 60)
+
+(defvar *max-request-body-bytes* (* 32 1024 1024)
+  ;; the longest body get-request-body will hold in memory, in bytes.
+  ;; It holds a body as a string, four bytes a character on SBCL and
+  ;; CCL, and the read happens outside any handler: on any kept-alive
+  ;; reply (with-http-body) and in request-query, so a request nobody
+  ;; published a door for can ask it.  A longer body, declared or found
+  ;; while reading, is not kept: get-request-body answers "", so
+  ;; request-query sees no form data in it, and the connection closes
+  ;; after the reply.  The streaming readers (get-multipart-sequence,
+  ;; get-request-body-incremental, with-body-input-stream) hold nothing
+  ;; and are not limited.  nil means no limit.
+  ;; (Genworks, 2026-11-04; to go upstream to Franz.)
+  )
+
+(defvar *max-drained-body-bytes* (* 128 1024 1024)
+  ;; how much of a refused body is read and dropped after the reply
+  ;; goes out.  Closing with bytes unread resets the connection, and
+  ;; the reset can reach the client ahead of the reply.  Reading them
+  ;; costs bandwidth but no memory, and it stops at this many bytes or
+  ;; after five seconds.
+  )
 (defvar *http-header-read-timeout* 60) ; seconds for complete header read
 
 (defvar *http-response-timeout* 
@@ -1754,7 +1776,13 @@ by keyword symbols and not by strings"
 					    (request-raw-request 
 					     *worker-request*))
 				      else "")
-				   cond))))))
+				   cond))))
+		        ;; running out of heap or stack is not an error, so
+		        ;; without this clause it reaches the debugger, and
+		        ;; a worker in the debugger never comes back
+		        (storage-condition (cond)
+		          (logmess (format nil "worker gave up its request: ~a"
+		                           cond)))))
 	     (t
 	      ; in debugging mode where we don't ignore errors
 	      ; still, we want to ignore connection-reset-by-peer
@@ -1981,6 +2009,9 @@ by keyword symbols and not by strings"
 		  
 		     (force-output-noblock (request-socket req))
 
+		     (if* (request-body-refused-p req)
+			then (drain-refused-body req))
+
                      (log-request req)
 		  
 		     (setq *worker-request* nil)
@@ -2157,6 +2188,65 @@ by keyword symbols and not by strings"
       (setf (request-has-continue-expectation req) nil))))
 
 
+(defun body-over-limit-p (bytes)
+  (and *max-request-body-bytes*
+       (> bytes *max-request-body-bytes*)))
+
+(defun body-extension (ans)
+  ;; how far to grow the body read so far: double it, but never past
+  ;; one character over the limit, where the read stops.  Past that a
+  ;; doubling would ask for twice the limit in one allocation.
+  (let ((size (length ans)))
+    (if* *max-request-body-bytes*
+       then (max 1 (min size (- (1+ *max-request-body-bytes*) size)))
+       else size)))
+
+(defun refuse-request-body (req)
+  ;; req's body is too long to hold: remember that, and close after
+  ;; the reply.  compute-strategy sees to a reply not begun yet.
+  (setf (getf (request-reply-plist req) 'body-refused) t)
+  (setf (request-reply-strategy req)
+    (remove :keep-alive (request-reply-strategy req) :test #'eq)))
+
+(defun request-body-refused-p (req)
+  ;; true when req's body was refused, or when it is over the limit by
+  ;; its own declaration and nothing has claimed it.  A streaming
+  ;; reader claims the body by setting request-request-body.
+  (or (getf (request-reply-plist req) 'body-refused)
+      (and (null (request-request-body req))
+	   (multiple-value-bind (length believe-it)
+	       (header-slot-value-integer req :content-length)
+	     (and believe-it (body-over-limit-p length))))))
+
+(defun drain-refused-body (req)
+  ;; the reply has gone out.  Close after this, reading and dropping a
+  ;; bounded part of the body first: see *max-drained-body-bytes*.
+  (logmess (format nil "refused a request body over ~d bytes: ~s"
+		   *max-request-body-bytes* (request-raw-request req)))
+  (setf (request-reply-strategy req)
+    (remove :keep-alive (request-reply-strategy req) :test #'eq))
+  (let ((sock (request-socket req))
+	(scratch (make-array 65536 :element-type '(unsigned-byte 8)))
+	(left *max-drained-body-bytes*)
+	(deadline (+ (get-universal-time) 5)))
+    (multiple-value-bind (length believe-it)
+	(header-slot-value-integer req :content-length)
+      (if* believe-it then (setq left (min left length))))
+    (setf (stream-external-format sock) (find-external-format :octets))
+    ;; with-timeout-local takes its time from the socket's read timeout
+    ;; where there is one, and that bounds one read, not a client that
+    ;; trickles: hence the deadline as well.
+    #+io-timeout
+    (ignore-errors (socket:socket-control sock :read-timeout 5))
+    (with-timeout-local (5 nil)
+      (loop
+	(if* (or (<= left 0) (> (get-universal-time) deadline))
+	   then (return))
+	(let ((got (rational-read-sequence scratch sock
+					   :end (min left (length scratch)))))
+	  (if* (<= got 0) then (return))
+	  (decf left got))))))
+
 (defmethod get-request-body ((req http-request)
 			     &key (external-format :octets ef-supplied))
   (let* ((result
@@ -2206,6 +2296,11 @@ by keyword symbols and not by strings"
 	  (multiple-value-setq (length believe-it)
 	    (header-slot-value-integer req :content-length))
     
+	  ;; A body too long to hold is neither read nor invited.
+	  (if* (and believe-it (body-over-limit-p length))
+	     then (refuse-request-body req)
+		  (return-from get-request-body-retrieve ""))
+
 	  ;; Send  Continue status if requested, regardless of body indicators.
 	  (when (member (request-method req) '(:put :post :patch))
 	    (when (request-has-continue-expectation req)
@@ -2266,7 +2361,10 @@ by keyword symbols and not by strings"
 						(append (request-headers req) trailers))))
 				    (return ans)
 			       else (vector-push-extend
-				     ch ans)))))
+				     ch ans (body-extension ans))
+				    (if* (body-over-limit-p (fill-pointer ans))
+				       then (refuse-request-body req)
+					    (return ""))))))
 		  
 		  ;; no content length given
 	   elseif (keep-alive-specified req)
@@ -2290,7 +2388,10 @@ by keyword symbols and not by strings"
 					sock nil :eof)))
 			       then (return  ans)
 			       else (vector-push-extend
-				     ch ans)))))
+				     ch ans (body-extension ans))
+				    (if* (body-over-limit-p (fill-pointer ans))
+				       then (refuse-request-body req)
+					    (return ""))))))
 	     else ;; Do nothing but remember that we already were here.
 		  "" 
 		  ))
@@ -3074,7 +3175,7 @@ in get-multipart-sequence"))
   (with-timeout-local (timeout nil)
     (let ((got 0))
       (loop
-	(let ((this (rational-read-sequence string sock :start got)))
+	(let ((this (rational-read-sequence string sock :start got :end length)))
 	  (if* (<= this got)
 	     then (return nil) ; eof too early
 	     else (setq  got    this)
