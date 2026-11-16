@@ -2247,6 +2247,34 @@ by keyword symbols and not by strings"
 	  (if* (<= got 0) then (return))
 	  (decf left got))))))
 
+(defun read-declared-body (length sock timeout)
+  ;; length characters of body from sock, read as they arrive: the string
+  ;; starts at 64K and grows fourfold, and goes to the whole length once an
+  ;; eighth of it has come, so what is held follows what the client has
+  ;; sent, not what it declared.  An idle connection that declares a large
+  ;; body holds 64K; the whole string needs an eighth of the body sent.
+  ;; Few steps, because each leaves its string for the collector: on
+  ;; Allegro, doubling all the way cost a burst of bodies at the limit 1.7
+  ;; times the memory of making the string at once.  nil if things go wrong, as for
+  ;; read-sequence-with-timeout.  (Genworks, 2026-11-16; to go upstream.)
+  (with-timeout-local (timeout nil)
+    (let ((ans (make-string (min length 65536)))
+	  (got 0))
+      (loop
+	(if* (>= got length) then (return ans))
+	(if* (>= got (length ans))
+	   then ; full: grow, never past length
+		(let ((new (make-string (if* (>= got (floor length 8))
+					    then length
+					    else (min length (* 4 (length ans)))))))
+		  (replace new ans)
+		  (setq ans new)))
+	(let ((this (rational-read-sequence ans sock :start got
+						 :end (length ans))))
+	  (if* (<= this got)
+	     then (return nil) ; eof too early
+	     else (setq got this)))))))
+
 (defmethod get-request-body ((req http-request)
 			     &key (external-format :octets ef-supplied))
   (let* ((result
@@ -2308,11 +2336,9 @@ by keyword symbols and not by strings"
 
 	  (if* (and believe-it (> length 0))
 	     then ;; we know the length
-		  (prog1 (let ((ret (make-string length)))
-			   (read-sequence-with-timeout 
-			    ret length 
-			    (request-socket req)
-			    (wserver-read-request-body-timeout *wserver*)))
+		  (prog1 (read-declared-body
+			   length (request-socket req)
+			   (wserver-read-request-body-timeout *wserver*))
 	    
 		    ;; netscape (at least) is buggy in that it sends a
 		    ;; crlf after the body.  We have to eat that crlf.

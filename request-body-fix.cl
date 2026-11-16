@@ -16,6 +16,12 @@
 ;;; 2. THE WORKER.  http-worker-thread handles error, and running out of
 ;;;    heap or stack is a storage-condition, so the worker went to the
 ;;;    debugger and did not come back.  That is fixed whatever the limit.
+;;; 3. THE ALLOCATION (2026-11-16).  The built-in makes the whole string
+;;;    from the declared length before a byte of body has come, so a client
+;;;    that declares the limit and sends nothing holds it for the body-read
+;;;    timeout.  A declared length over 64K is now read as it arrives: 64K
+;;;    first, fourfold, then the whole length once an eighth of it has
+;;;    come.  Also whatever the limit.
 ;;;
 ;;; Nothing here copies the built-in's code: the built-in's functions are
 ;;; wrapped, so this serves any aserve that has them.
@@ -134,14 +140,57 @@ reply.  It stops at this many bytes or after five seconds.")
                    (return ""))))))
       (setf (stream-external-format sock) original-ef))))
 
+(defun read-declared-body-as-it-arrives (req length)
+  ;; what the built-in's read of a declared length does -- the :octets
+  ;; format, 100 Continue, a stray CRLF after the body eaten -- but the
+  ;; string starts at 64K, grows fourfold as the bytes arrive, and goes to
+  ;; the whole LENGTH once an eighth of it has come, so what is held follows
+  ;; what the client has sent, not what it declared.  Few steps, because
+  ;; Allegro keeps each step's string until a global collection.  nil if the body ends early or the read times out, as the
+  ;; built-in's.  (2026-11-16.)
+  (let* ((sock (request-socket req))
+         (original-ef (stream-external-format sock)))
+    (unwind-protect
+         (progn
+           (setf (stream-external-format sock) (find-external-format :octets))
+           (when (and (member (request-method req) '(:put :post :patch))
+                      (request-has-continue-expectation req))
+             (send-100-continue req))
+           (prog1 (with-timeout-local ((wserver-read-request-body-timeout *wserver*) nil)
+                    (let ((ans (make-string (min length 65536)))
+                          (got 0))
+                      (loop
+                        (when (>= got length) (return ans))
+                        (when (>= got (length ans))
+                          (let ((new (make-string (if (>= got (floor length 8))
+                                                      length
+                                                      (min length (* 4 (length ans)))))))
+                            (replace new ans)
+                            (setq ans new)))
+                        (let ((this (read-sequence ans sock :start got :end (length ans)
+                                                            :partial-fill t)))
+                          (when (<= this got) (return nil))
+                          (setq got this)))))
+             (let ((ch (read-char-no-hang sock nil nil)))
+               (cond ((eql ch #\return)
+                      (let ((next (read-char-no-hang sock nil nil)))
+                        (when (and next (not (eql next #\linefeed)))
+                          (unread-char next sock))))
+                     (ch (unread-char ch sock))))))
+      (setf (stream-external-format sock) original-ef))))
+
 (excl:def-fwrapper limit-request-body (req)
   (multiple-value-bind (length believe-it)
       (header-slot-value-integer req :content-length)
-    (cond ((null *max-request-body-bytes*) (excl:call-next-fwrapper))
-          ((and believe-it (body-over-limit-p length))
+    (cond ((and believe-it (body-over-limit-p length))
            (refuse-request-body req)
            "")
-          (believe-it (excl:call-next-fwrapper))
+          ;; a declared length is held as it arrives, limit or not; a
+          ;; small one is left to the built-in
+          ((and believe-it (> length 65536))
+           (read-declared-body-as-it-arrives req length))
+          ((or believe-it (null *max-request-body-bytes*))
+           (excl:call-next-fwrapper))
           ((equalp "chunked" (header-slot-value req :transfer-encoding))
            (read-chunked-body-within-limit req))
           ((or (keep-alive-specified req)
