@@ -2538,9 +2538,12 @@ by keyword symbols and not by strings"
 			      (setq ch (read-char-no-hang 
 					(request-socket req)
 					nil nil))
+			      ;; nil when the LF has not come yet: nothing
+			      ;; to put back (Genworks, 2026-11-17, Ruling 284)
 			      (if* (eq ch #\linefeed)
 				 thenret 
-				 else (unread-char 
+			       elseif ch
+				 then (unread-char 
 				       ch (request-socket req)))
 		       elseif ch
 			 then (unread-char ch (request-socket
