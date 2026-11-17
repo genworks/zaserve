@@ -28,6 +28,17 @@
 ;;;    when each request ends.  A read that would pass it waits a few
 ;;;    seconds for room, then is turned away (marked :budget).  Off until
 ;;;    set, as the limit is.
+;;; 5. FRANZ'S 1.3.96 (2026-11-16, Rulings 246 and 248).  Franz's aserve
+;;;    1.3.96 counts chunked and read-to-end bodies against its own
+;;;    wserver-max-content-length and signals request-body-too-large.
+;;;    Where that limit is set and at least as strict as
+;;;    *max-request-body-bytes*, those bodies are left to it; a stricter
+;;;    *max-request-body-bytes* (Cyclops binds one per rule) still reads
+;;;    them here.  A declared length over the built-in's limit, when that
+;;;    is the stricter, goes to the built-in too, which refuses it before
+;;;    making the string.  No 100 Continue is sent for a declared length
+;;;    over *max-request-body-bytes*, and no body is drained from a client
+;;;    never invited to send it.
 ;;;
 ;;; Nothing here copies the built-in's code: the built-in's functions are
 ;;; wrapped, so this serves any aserve that has them.
@@ -54,6 +65,36 @@ reply.  It stops at this many bytes or after five seconds.")
   (and *max-request-body-bytes*
        (> bytes *max-request-body-bytes*)))
 
+(defun declared-body-over-limit-p (req)
+  ;; true when REQ declares a body longer than *max-request-body-bytes*
+  (multiple-value-bind (length believe-it)
+      (header-slot-value-integer req :content-length)
+    (and believe-it (body-over-limit-p length))))
+
+(defun builtin-body-limit ()
+  ;; the built-in's own limit, wserver-max-content-length, or nil
+  (and (fboundp 'wserver-max-content-length)
+       (boundp '*wserver*) *wserver*
+       (funcall 'wserver-max-content-length *wserver*)))
+
+(defun builtin-limit-binds-p ()
+  ;; true when the built-in's limit is set and at least as strict as
+  ;; *max-request-body-bytes*, so a body it passes, ours passes too
+  (let ((theirs (builtin-body-limit)))
+    (and theirs
+         (or (null *max-request-body-bytes*)
+             (<= theirs *max-request-body-bytes*)))))
+
+(defun builtin-limits-whole-body-p ()
+  ;; true on Franz's aserve 1.3.96 or later, which counts chunked and
+  ;; read-to-end bodies against its limit as it reads them
+  (and (find-class 'request-body-too-large nil) t))
+
+(defun builtin-body-too-large-p (req)
+  ;; Franz's 1.3.96 mark of a body it gave up on; nil before 1.3.96
+  (and (fboundp 'request-body-too-large-p)
+       (funcall 'request-body-too-large-p req)))
+
 (defun refuse-request-body (req &optional (why t))
   ;; req's body is not to be held: remember that, and why (t for a body
   ;; over the limit, :budget for one turned away because the bodies in
@@ -76,13 +117,24 @@ reply.  It stops at this many bytes or after five seconds.")
 (defun drain-refused-body (req)
   ;; the reply has gone out.  Close after this, reading and dropping a
   ;; bounded part of the body first: see *max-drained-body-bytes*.
-  (logmess (if (eq (getf (request-reply-plist req) 'body-refused) :budget)
-               (format nil "turned away a request body, the bodies in flight at their budget of ~d: ~s"
-                       *max-body-bytes-in-flight* (request-raw-request req))
-               (format nil "refused a request body over ~d bytes: ~s"
-                       *max-request-body-bytes* (request-raw-request req))))
+  (logmess (case (getf (request-reply-plist req) 'body-refused)
+             (:budget
+              (format nil "turned away a request body, the bodies in flight at their budget of ~d: ~s"
+                      *max-body-bytes-in-flight* (request-raw-request req)))
+             ;; marked by a caller that gave up on a body too slow to come
+             ;; (Cyclops, Ruling 240): no limit was passed
+             (:late
+              (format nil "gave up on a request body too slow to arrive: ~s"
+                      (request-raw-request req)))
+             (t
+              (format nil "refused a request body over ~d bytes: ~s"
+                      *max-request-body-bytes* (request-raw-request req)))))
   (setf (request-reply-strategy req)
     (remove :keep-alive (request-reply-strategy req) :test #'eq))
+  ;; a client still waiting for 100 Continue was never invited to send
+  ;; the body (send-100-continue :around), so there is none to read
+  (when (request-has-continue-expectation req)
+    (return-from drain-refused-body nil))
   (let ((sock (request-socket req))
         (scratch (make-array 65536 :element-type '(unsigned-byte 8)))
         (left *max-drained-body-bytes*)
@@ -254,7 +306,12 @@ default here as for the limit, is no budget.")
 (excl:def-fwrapper limit-request-body (req)
   (multiple-value-bind (length believe-it)
       (header-slot-value-integer req :content-length)
-    (cond ((and believe-it (body-over-limit-p length))
+    (cond ;; over the built-in's own limit, the stricter: its answer, as
+          ;; it documents, before any string is made
+          ((and believe-it (builtin-limit-binds-p)
+                (> length (builtin-body-limit)))
+           (excl:call-next-fwrapper))
+          ((and believe-it (body-over-limit-p length))
            (refuse-request-body req)
            "")
           ;; a declared length is held as it arrives, limit or not; a
@@ -262,6 +319,10 @@ default here as for the limit, is no budget.")
           ((and believe-it (> length 65536))
            (read-declared-body-as-it-arrives req length))
           ((or believe-it (null *max-request-body-bytes*))
+           (excl:call-next-fwrapper))
+          ;; 1.3.96 or later limits these bodies itself; where its limit
+          ;; is the stricter, it reads them (Ruling 248)
+          ((and (builtin-limits-whole-body-p) (builtin-limit-binds-p))
            (excl:call-next-fwrapper))
           ((equalp "chunked" (header-slot-value req :transfer-encoding))
            (read-chunked-body-within-limit req))
@@ -281,12 +342,21 @@ default here as for the limit, is no budget.")
 (defmethod compute-strategy :around ((req http-request) (ent entity) format)
   ;; a body too long to hold is not read, so the connection cannot be
   ;; kept: its bytes are still in the way of the next request
+  ;; Franz's 1.3.96 defines this same method for its own mark, which this
+  ;; one replaces, so it answers for both
   (declare (ignore format))
   (let ((strategy (call-next-method)))
-    (if (request-body-refused-p req)
+    (if (or (request-body-refused-p req) (builtin-body-too-large-p req))
         (setf (request-reply-strategy req)
           (remove :keep-alive strategy :test #'eq))
         strategy)))
+
+(defmethod send-100-continue :around ((req http-request))
+  ;; no invitation for a body declared over the limit, which will not be
+  ;; read; the expectation stays set, and drain-refused-body then knows
+  ;; no body is coming (Ruling 246)
+  (unless (declared-body-over-limit-p req)
+    (call-next-method)))
 
 (defmethod handle-request :around ((req http-request))
   ;; what this request's body took from the budget of bodies in flight

@@ -427,6 +427,35 @@ will be logged with one log entry per line in some cases.")
   ;; costs bandwidth but no memory, and it stops at this many bytes or
   ;; after five seconds.
   )
+
+(defvar *signal-request-body-too-large* nil
+  ;; true to have get-request-body signal request-body-too-large for a
+  ;; body it did not keep, as Franz's aserve does from 1.3.96, every time
+  ;; it is called for that request.  nil, the default, answers ""
+  ;; instead; request-body-too-large-p says whether that is what
+  ;; happened.  The body read that keeps a connection alive after a
+  ;; reply (with-http-response) never signals it.
+  ;; (Genworks, 2026-11-16, Ruling 247.)
+  )
+
+(define-condition request-body-too-large (error)
+  ;; Franz's aserve 1.3.96 condition, under its name and readers: a
+  ;; request body was not kept.  length is how much of it was declared or
+  ;; read when it was stopped, nil if not known; max-length the limit it
+  ;; passed.  why is :limit, or :budget for a body turned away because
+  ;; the bodies in flight were at their budget (*max-body-bytes-in-flight*).
+  ((length :initarg :length :initform nil :reader request-body-too-large-length)
+   (max-length :initarg :max-length :initform nil
+	       :reader request-body-too-large-max-length)
+   (why :initarg :why :initform :limit :reader request-body-too-large-why))
+  (:report (lambda (c stream)
+	     (if* (eq (request-body-too-large-why c) :budget)
+		then (format stream "request body not read: the bodies in flight were at their budget of ~d"
+			     (request-body-too-large-max-length c))
+		else (format stream "request body of at least ~d octets exceeds the limit of ~d octets"
+			     (request-body-too-large-length c)
+			     (request-body-too-large-max-length c))))))
+
 (defvar *http-header-read-timeout* 60) ; seconds for complete header read
 
 (defvar *http-response-timeout* 
@@ -595,6 +624,14 @@ died. Use nil to specify no timeout.")
     :initform *http-free-worker-timeout*
     :initarg :free-worker-timeout
     :accessor wserver-free-worker-timeout)
+
+   (max-content-length
+    ;; the longest request body to read, in octets; nil is no limit.
+    ;; Franz's name, from aserve 1.3.96.  Here the limit in force is the
+    ;; smaller of it and *max-request-body-bytes* (body-limit).
+    :initform nil
+    :initarg :max-content-length
+    :accessor wserver-max-content-length)
    
    ;;
    ;; -- internal slots --
@@ -878,8 +915,11 @@ Problems with protocol may occur." (ef-name ef)))))
                  ,@body))
        
        (if* (member :keep-alive (request-reply-strategy ,g-req) :test #'eq)
-	  then ; force the body to be read so we can continue
-	       (get-request-body ,g-req))
+	  then ; force the body to be read so we can continue.  A body
+	       ; turned away then closes the connection after the reply,
+	       ; which must not be lost to *signal-request-body-too-large*.
+	       (handler-case (get-request-body ,g-req)
+		 (request-body-too-large () nil)))
        (send-response-headers ,g-req ,g-ent :post))))
 			  
 
@@ -1196,7 +1236,15 @@ by keyword symbols and not by strings"
     :accessor request-reply-protocol-string)
 
    (has-expect-continue :accessor request-has-continue-expectation
-			:initform nil))
+			:initform nil)
+
+   (body-too-large
+    ;; a request-body-too-large condition, made but not signaled unless
+    ;; *signal-request-body-too-large* is true, once the body has been
+    ;; turned away (refuse-request-body); nil otherwise.  Franz's
+    ;; accessor name, from aserve 1.3.96.
+    :initform nil
+    :accessor request-body-too-large-p))
   
   
 		
@@ -1347,6 +1395,7 @@ by keyword symbols and not by strings"
 		   backlog
 		   (compress (and (member :zlib-deflate *features*) t))
 		   (reuse-socket-address t)
+		   (max-content-length nil max-content-length-p)
 		   )
   ;; -exported-
   ;;
@@ -1371,6 +1420,13 @@ by keyword symbols and not by strings"
 			 :enable-compression compress)))
 
   (if* efp then (setf (wserver-external-format server) external-format))
+
+  (if* max-content-length-p
+     then (if* (not (or (null max-content-length)
+			(integerp max-content-length)))
+	     then (error "max-content-length must be nil or an integer, not ~s"
+			 max-content-length))
+	  (setf (wserver-max-content-length server) max-content-length))
 	  
   ;; the only required ssl arg is a certificate. check that a certificate has been specified here, so
   ;; that we can error immediately instead of when the first https connection is attempted.
@@ -2187,7 +2243,11 @@ by keyword symbols and not by strings"
 
 
 (defmethod send-100-continue ((req http-request))
-  (when (request-has-continue-expectation req)
+  ;; Not for a body declared over the limit, which will not be read: the
+  ;; expectation then stays set, and drain-refused-body knows the client
+  ;; was never invited to send it.  (Genworks, 2026-11-16, Ruling 246.)
+  (when (and (request-has-continue-expectation req)
+	     (not (declared-body-over-limit-p req)))
     (let ((sock (request-socket req)))
       (format sock "~a 100 Continue~a~a"
 	      (request-protocol-string req) *crlf* *crlf*)
@@ -2195,25 +2255,52 @@ by keyword symbols and not by strings"
       (setf (request-has-continue-expectation req) nil))))
 
 
+(defun body-limit ()
+  ;; the body limit in force, in bytes, or nil: the smaller of
+  ;; *max-request-body-bytes* and the server's max-content-length
+  ;; (Ruling 247), either of which may be nil
+  (let ((ours *max-request-body-bytes*)
+	(theirs (and (boundp '*wserver*) *wserver*
+		     (wserver-max-content-length *wserver*))))
+    (if* (and ours theirs)
+       then (min ours theirs)
+       else (or ours theirs))))
+
 (defun body-over-limit-p (bytes)
-  (and *max-request-body-bytes*
-       (> bytes *max-request-body-bytes*)))
+  (let ((limit (body-limit)))
+    (and limit (> bytes limit))))
+
+(defun declared-body-over-limit-p (req)
+  ;; true when req declares a body longer than the limit
+  (multiple-value-bind (length believe-it)
+      (header-slot-value-integer req :content-length)
+    (and believe-it (body-over-limit-p length))))
 
 (defun body-extension (ans)
   ;; how far to grow the body read so far: double it, but never past
   ;; one character over the limit, where the read stops.  Past that a
   ;; doubling would ask for twice the limit in one allocation.
-  (let ((size (length ans)))
-    (if* *max-request-body-bytes*
-       then (max 1 (min size (- (1+ *max-request-body-bytes*) size)))
+  (let ((size (length ans))
+	(limit (body-limit)))
+    (if* limit
+       then (max 1 (min size (- (1+ limit) size)))
        else size)))
 
-(defun refuse-request-body (req &optional (why t))
+(defun refuse-request-body (req &optional (why t) length)
   ;; req's body is not to be held: remember that, and why (t for a body
   ;; over the limit, :budget for one turned away because the bodies in
   ;; flight were at their budget), and close after the reply.
-  ;; compute-strategy sees to a reply not begun yet.
+  ;; compute-strategy sees to a reply not begun yet.  length is what was
+  ;; declared or read when it stopped, if known, for the condition that
+  ;; request-body-too-large-p answers (signaled by get-request-body only
+  ;; under *signal-request-body-too-large*).
   (setf (getf (request-reply-plist req) 'body-refused) why)
+  (setf (request-body-too-large-p req)
+    (if* (eq why :budget)
+       then (make-condition 'request-body-too-large
+			    :why :budget :length length :max-length (body-budget))
+       else (make-condition 'request-body-too-large
+			    :why :limit :length length :max-length (body-limit))))
   (setf (request-reply-strategy req)
     (remove :keep-alive (request-reply-strategy req) :test #'eq)))
 
@@ -2223,20 +2310,29 @@ by keyword symbols and not by strings"
   ;; reader claims the body by setting request-request-body.
   (or (getf (request-reply-plist req) 'body-refused)
       (and (null (request-request-body req))
-	   (multiple-value-bind (length believe-it)
-	       (header-slot-value-integer req :content-length)
-	     (and believe-it (body-over-limit-p length))))))
+	   (declared-body-over-limit-p req))))
 
 (defun drain-refused-body (req)
   ;; the reply has gone out.  Close after this, reading and dropping a
   ;; bounded part of the body first: see *max-drained-body-bytes*.
-  (logmess (if* (eq (getf (request-reply-plist req) 'body-refused) :budget)
-	      then (format nil "turned away a request body, the bodies in flight at their budget of ~d: ~s"
-			   (body-budget) (request-raw-request req))
-	      else (format nil "refused a request body over ~d bytes: ~s"
-			   *max-request-body-bytes* (request-raw-request req))))
+  (logmess (case (getf (request-reply-plist req) 'body-refused)
+	     (:budget
+	      (format nil "turned away a request body, the bodies in flight at their budget of ~d: ~s"
+		      (body-budget) (request-raw-request req)))
+	     ;; marked by a caller that gave up on a body too slow to come
+	     ;; (Cyclops, Ruling 240): no limit was passed
+	     (:late
+	      (format nil "gave up on a request body too slow to arrive: ~s"
+		      (request-raw-request req)))
+	     (t
+	      (format nil "refused a request body over ~d bytes: ~s"
+		      (body-limit) (request-raw-request req)))))
   (setf (request-reply-strategy req)
     (remove :keep-alive (request-reply-strategy req) :test #'eq))
+  ;; a client still waiting for 100 Continue was never invited to send
+  ;; the body (send-100-continue), so there is none to read
+  (if* (request-has-continue-expectation req)
+     then (return-from drain-refused-body nil))
   (let ((sock (request-socket req))
 	(scratch (make-array 65536 :element-type '(unsigned-byte 8)))
 	(left *max-drained-body-bytes*)
@@ -2286,7 +2382,7 @@ by keyword symbols and not by strings"
   ;; when asked, since a saved image may run with another heap
   (let ((budget *max-body-bytes-in-flight*))
     (if* (eq budget :auto)
-       then (max (or *max-request-body-bytes* 0)
+       then (max (or (body-limit) 0)
 		 #+sbcl (floor (sb-ext:dynamic-space-size) 32)
 		 #-sbcl (* 128 1024 1024))
        else budget)))
@@ -2363,6 +2459,11 @@ by keyword symbols and not by strings"
 	  (or (request-request-body req)
 	      (setf (request-request-body req)
 		(get-request-body-retrieve-and-maybe-log req)))))
+    ;; a body turned away: "", or under *signal-request-body-too-large*
+    ;; Franz's error, every time it is asked for (Ruling 247)
+    (let ((c (request-body-too-large-p req)))
+      (if* (and c *signal-request-body-too-large*)
+	 then (error c)))
     (if* (and ef-supplied result) ; spr27296
        then (values
 	     (octets-to-string
@@ -2406,7 +2507,7 @@ by keyword symbols and not by strings"
     
 	  ;; A body too long to hold is neither read nor invited.
 	  (if* (and believe-it (body-over-limit-p length))
-	     then (refuse-request-body req)
+	     then (refuse-request-body req t length)
 		  (return-from get-request-body-retrieve ""))
 
 	  ;; Send  Continue status if requested, regardless of body indicators.
@@ -2478,7 +2579,7 @@ by keyword symbols and not by strings"
 				    (vector-push-extend
 				     ch ans (body-extension ans))
 				    (if* (body-over-limit-p (fill-pointer ans))
-				       then (refuse-request-body req)
+				       then (refuse-request-body req t (fill-pointer ans))
 					    (return ""))))))
 		  
 		  ;; no content length given
@@ -2510,7 +2611,7 @@ by keyword symbols and not by strings"
 				    (vector-push-extend
 				     ch ans (body-extension ans))
 				    (if* (body-over-limit-p (fill-pointer ans))
-				       then (refuse-request-body req)
+				       then (refuse-request-body req t (fill-pointer ans))
 					    (return ""))))))
 	     else ;; Do nothing but remember that we already were here.
 		  "" 

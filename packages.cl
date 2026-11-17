@@ -159,6 +159,10 @@ without compression.  Original error loading deflate was:~%~a~%~:@>" c)
    #:get-multipart-sequence
    #:get-request-body
    #:get-request-body-incremental
+   #:request-body-too-large	; condition, as in Franz's 1.3.96
+   #:request-body-too-large-length
+   #:request-body-too-large-max-length
+   #:request-body-too-large-p
    #:handle-request
    #:handle-uri		; add-on component..
    #:header-slot-value
@@ -246,6 +250,7 @@ without compression.  Original error loading deflate was:~%~a~%~:@>" c)
    #:wserver-log-stream
    #:wserver-response-timeout
    #:wserver-free-worker-timeout
+   #:wserver-max-content-length
    #:wserver-socket
    #:wserver-vhosts
    #:log-for-wserver
