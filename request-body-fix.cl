@@ -22,6 +22,12 @@
 ;;;    timeout.  A declared length over 64K is now read as it arrives: 64K
 ;;;    first, fourfold, then the whole length once an eighth of it has
 ;;;    come.  Also whatever the limit.
+;;; 4. THE TOTAL (2026-11-16).  A limit bounds one request; many at once
+;;;    still add up.  *max-body-bytes-in-flight* is a budget for all bodies
+;;;    being read together, charged as their strings grow and given back
+;;;    when each request ends.  A read that would pass it waits a few
+;;;    seconds for room, then is turned away (marked :budget).  Off until
+;;;    set, as the limit is.
 ;;;
 ;;; Nothing here copies the built-in's code: the built-in's functions are
 ;;; wrapped, so this serves any aserve that has them.
@@ -48,10 +54,12 @@ reply.  It stops at this many bytes or after five seconds.")
   (and *max-request-body-bytes*
        (> bytes *max-request-body-bytes*)))
 
-(defun refuse-request-body (req)
-  ;; req's body is too long to hold: remember that, and close after the
-  ;; reply.  compute-strategy sees to a reply not begun yet.
-  (setf (getf (request-reply-plist req) 'body-refused) t)
+(defun refuse-request-body (req &optional (why t))
+  ;; req's body is not to be held: remember that, and why (t for a body
+  ;; over the limit, :budget for one turned away because the bodies in
+  ;; flight were at their budget), and close after the reply.
+  ;; compute-strategy sees to a reply not begun yet.
+  (setf (getf (request-reply-plist req) 'body-refused) why)
   (setf (request-reply-strategy req)
     (remove :keep-alive (request-reply-strategy req) :test #'eq)))
 
@@ -68,8 +76,11 @@ reply.  It stops at this many bytes or after five seconds.")
 (defun drain-refused-body (req)
   ;; the reply has gone out.  Close after this, reading and dropping a
   ;; bounded part of the body first: see *max-drained-body-bytes*.
-  (logmess (format nil "refused a request body over ~d bytes: ~s"
-                   *max-request-body-bytes* (request-raw-request req)))
+  (logmess (if (eq (getf (request-reply-plist req) 'body-refused) :budget)
+               (format nil "turned away a request body, the bodies in flight at their budget of ~d: ~s"
+                       *max-body-bytes-in-flight* (request-raw-request req))
+               (format nil "refused a request body over ~d bytes: ~s"
+                       *max-request-body-bytes* (request-raw-request req))))
   (setf (request-reply-strategy req)
     (remove :keep-alive (request-reply-strategy req) :test #'eq))
   (let ((sock (request-socket req))
@@ -94,17 +105,64 @@ reply.  It stops at this many bytes or after five seconds.")
           (when (<= got 0) (return))
           (decf left got))))))
 
+(defvar *max-body-bytes-in-flight* nil
+  "The most body, in characters, all requests together may hold while they
+read: a backstop under *max-request-body-bytes*, which bounds one request and
+not the total.  A read that would pass it waits up to *body-budget-wait*
+seconds for room, then is turned away like a body over the limit, marked
+:budget.  Charged as the string grows, so an idle connection costs it 64K.
+Keep it above the limit, or a body at the limit is never admitted.  NIL, the
+default here as for the limit, is no budget.")
+
+(defvar *body-budget-wait* 5
+  "Seconds a read waits for room in the budget before it is turned away.")
+
+(defvar *body-bytes-in-flight* 0)
+
+(defvar *body-budget-lock* (mp:make-process-lock :name "body budget"))
+
+(defun reserve-body-bytes! (req n)
+  ;; take N more characters for REQ's body from the budget, waiting up to
+  ;; *body-budget-wait* seconds for room; true when taken
+  (if (or (null *max-body-bytes-in-flight*) (<= n 0))
+      t
+      (let ((deadline (+ (get-internal-real-time)
+                         (* *body-budget-wait* internal-time-units-per-second))))
+        (loop
+          (when (mp:with-process-lock (*body-budget-lock*)
+                  (when (<= (+ *body-bytes-in-flight* n) *max-body-bytes-in-flight*)
+                    (incf *body-bytes-in-flight* n)
+                    (incf (getf (request-reply-plist req) 'body-reserved 0) n)
+                    t))
+            (return t))
+          (when (> (get-internal-real-time) deadline) (return nil))
+          (sleep 0.05)))))
+
+(defun release-body-bytes! (req)
+  ;; give back what REQ's body took from the budget; at the end of the
+  ;; request, however it ends (handle-request :around below)
+  (let ((n (getf (request-reply-plist req) 'body-reserved 0)))
+    (when (> n 0)
+      (mp:with-process-lock (*body-budget-lock*)
+        (decf *body-bytes-in-flight* n))
+      (setf (getf (request-reply-plist req) 'body-reserved) 0))))
+
 (defun new-body ()
   (make-array 2048 :element-type 'character :adjustable t :fill-pointer 0))
 
-(defun add-to-body (char ans)
-  ;; true when ans is now over the limit.  It grows by doubling, but never
-  ;; past one character over the limit, where the read stops: past that a
-  ;; doubling would ask for twice the limit in one allocation.
-  (let ((size (length ans)))
-    (vector-push-extend
-     char ans (max 1 (min size (- (1+ *max-request-body-bytes*) size)))))
-  (body-over-limit-p (fill-pointer ans)))
+(defun add-to-body (req char ans)
+  ;; add CHAR to ANS: :limit when ANS is now over the limit, :budget when it
+  ;; could not grow within the budget of bodies in flight, else nil.  It
+  ;; grows by doubling, but never past one character over the limit, where
+  ;; the read stops: past that a doubling would ask for twice the limit in
+  ;; one allocation.
+  (let* ((size (length ans))
+         (extension (max 1 (min size (- (1+ *max-request-body-bytes*) size)))))
+    (when (and (= (fill-pointer ans) (array-dimension ans 0))
+               (not (reserve-body-bytes! req extension)))
+      (return-from add-to-body :budget))
+    (vector-push-extend char ans extension))
+  (and (body-over-limit-p (fill-pointer ans)) :limit))
 
 (defun read-chunked-body-within-limit (req)
   ;; the built-in's incremental reader does the dechunking and the
@@ -114,9 +172,10 @@ reply.  It stops at this many bytes or after five seconds.")
      req
      (lambda (buffer count)
        (dotimes (i count)
-         (when (add-to-body (code-char (aref buffer i)) ans)
-           (refuse-request-body req)
-           (return-from read-chunked-body-within-limit ""))))
+         (let ((why (add-to-body req (code-char (aref buffer i)) ans)))
+           (when why
+             (refuse-request-body req (if (eq why :budget) :budget t))
+             (return-from read-chunked-body-within-limit "")))))
      :buffer (make-array 65536 :element-type '(unsigned-byte 8)))
     ans))
 
@@ -135,9 +194,10 @@ reply.  It stops at this many bytes or after five seconds.")
              (loop
                (let ((ch (read-char sock nil :eof)))
                  (when (eq ch :eof) (return ans))
-                 (when (add-to-body ch ans)
-                   (refuse-request-body req)
-                   (return ""))))))
+                 (let ((why (add-to-body req ch ans)))
+                   (when why
+                     (refuse-request-body req (if (eq why :budget) :budget t))
+                     (return "")))))))
       (setf (stream-external-format sock) original-ef))))
 
 (defun read-declared-body-as-it-arrives (req length)
@@ -146,8 +206,13 @@ reply.  It stops at this many bytes or after five seconds.")
   ;; string starts at 64K, grows fourfold as the bytes arrive, and goes to
   ;; the whole LENGTH once an eighth of it has come, so what is held follows
   ;; what the client has sent, not what it declared.  Few steps, because
-  ;; Allegro keeps each step's string until a global collection.  nil if the body ends early or the read times out, as the
-  ;; built-in's.  (2026-11-16.)
+  ;; Allegro keeps each step's string until a global collection.  Each step
+  ;; is charged to the budget of bodies in flight; a step it cannot take
+  ;; turns the body away and answers "".  nil if the body ends early or
+  ;; the read times out, as the built-in's.  (2026-11-16.)
+  (unless (reserve-body-bytes! req (min length 65536))
+    (refuse-request-body req :budget)
+    (return-from read-declared-body-as-it-arrives ""))
   (let* ((sock (request-socket req))
          (original-ef (stream-external-format sock)))
     (unwind-protect
@@ -162,16 +227,23 @@ reply.  It stops at this many bytes or after five seconds.")
                       (loop
                         (when (>= got length) (return ans))
                         (when (>= got (length ans))
-                          (let ((new (make-string (if (>= got (floor length 8))
-                                                      length
-                                                      (min length (* 4 (length ans)))))))
-                            (replace new ans)
-                            (setq ans new)))
+                          (let ((size (if (>= got (floor length 8))
+                                          length
+                                          (min length (* 4 (length ans))))))
+                            (unless (reserve-body-bytes! req (- size (length ans)))
+                              (refuse-request-body req :budget)
+                              (return ""))
+                            (let ((new (make-string size)))
+                              (replace new ans)
+                              (setq ans new))))
                         (let ((this (read-sequence ans sock :start got :end (length ans)
                                                             :partial-fill t)))
                           (when (<= this got) (return nil))
                           (setq got this)))))
-             (let ((ch (read-char-no-hang sock nil nil)))
+             ;; not after a body turned away part way: the rest of it
+             ;; is still there, for the drain
+             (let ((ch (unless (getf (request-reply-plist req) 'body-refused)
+                         (read-char-no-hang sock nil nil))))
                (cond ((eql ch #\return)
                       (let ((next (read-char-no-hang sock nil nil)))
                         (when (and next (not (eql next #\linefeed)))
@@ -202,7 +274,8 @@ reply.  It stops at this many bytes or after five seconds.")
   (declare (ignorable sock))
   (handler-case (excl:call-next-fwrapper)
     (storage-condition (cond)
-      (logmess (format nil "worker gave up its request: ~a" cond))
+      (logmess (or (ignore-errors (format nil "worker gave up its request: ~a" cond))
+                   "worker gave up its request: a storage condition"))
       nil)))
 
 (defmethod compute-strategy :around ((req http-request) (ent entity) format)
@@ -214,6 +287,12 @@ reply.  It stops at this many bytes or after five seconds.")
         (setf (request-reply-strategy req)
           (remove :keep-alive strategy :test #'eq))
         strategy)))
+
+(defmethod handle-request :around ((req http-request))
+  ;; what this request's body took from the budget of bodies in flight
+  ;; goes back when the request ends, however it ends
+  (unwind-protect (call-next-method)
+    (release-body-bytes! req)))
 
 (defmethod handle-request :after ((req http-request))
   (when (request-body-refused-p req)

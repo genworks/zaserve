@@ -1767,22 +1767,29 @@ by keyword symbols and not by strings"
 		(error (cond)
 		  (if* (connection-reset-error cond)
 		     thenret ; don't print these errors,
-		     else (logmess 
-			   (format nil "~agot the error ~a~%" 
-				   (if* *worker-request*
-				      then (format 
-					    nil 
-					    "while processing command ~s~%"
-					    (request-raw-request 
-					     *worker-request*))
-				      else "")
-				   cond))))
+		     else ;; printing the condition can fail too (zacl prints
+			  ;; a closed socket by asking it its address), and an
+			  ;; error here has no handler left: the debugger
+			  (logmess
+			   (or (ignore-errors
+				(format nil "~agot the error ~a~%" 
+					(if* *worker-request*
+					   then (format 
+						 nil 
+						 "while processing command ~s~%"
+						 (request-raw-request 
+						  *worker-request*))
+					   else "")
+					cond))
+			       (format nil "got an error of type ~s~%"
+				       (type-of cond))))))
 		        ;; running out of heap or stack is not an error, so
 		        ;; without this clause it reaches the debugger, and
 		        ;; a worker in the debugger never comes back
 		        (storage-condition (cond)
-		          (logmess (format nil "worker gave up its request: ~a"
-		                           cond)))))
+		          (logmess (or (ignore-errors
+		                        (format nil "worker gave up its request: ~a" cond))
+		                       "worker gave up its request: a storage condition")))))
 	     (t
 	      ; in debugging mode where we don't ignore errors
 	      ; still, we want to ignore connection-reset-by-peer
@@ -2201,10 +2208,12 @@ by keyword symbols and not by strings"
        then (max 1 (min size (- (1+ *max-request-body-bytes*) size)))
        else size)))
 
-(defun refuse-request-body (req)
-  ;; req's body is too long to hold: remember that, and close after
-  ;; the reply.  compute-strategy sees to a reply not begun yet.
-  (setf (getf (request-reply-plist req) 'body-refused) t)
+(defun refuse-request-body (req &optional (why t))
+  ;; req's body is not to be held: remember that, and why (t for a body
+  ;; over the limit, :budget for one turned away because the bodies in
+  ;; flight were at their budget), and close after the reply.
+  ;; compute-strategy sees to a reply not begun yet.
+  (setf (getf (request-reply-plist req) 'body-refused) why)
   (setf (request-reply-strategy req)
     (remove :keep-alive (request-reply-strategy req) :test #'eq)))
 
@@ -2221,8 +2230,11 @@ by keyword symbols and not by strings"
 (defun drain-refused-body (req)
   ;; the reply has gone out.  Close after this, reading and dropping a
   ;; bounded part of the body first: see *max-drained-body-bytes*.
-  (logmess (format nil "refused a request body over ~d bytes: ~s"
-		   *max-request-body-bytes* (request-raw-request req)))
+  (logmess (if* (eq (getf (request-reply-plist req) 'body-refused) :budget)
+	      then (format nil "turned away a request body, the bodies in flight at their budget of ~d: ~s"
+			   (body-budget) (request-raw-request req))
+	      else (format nil "refused a request body over ~d bytes: ~s"
+			   *max-request-body-bytes* (request-raw-request req))))
   (setf (request-reply-strategy req)
     (remove :keep-alive (request-reply-strategy req) :test #'eq))
   (let ((sock (request-socket req))
@@ -2247,7 +2259,66 @@ by keyword symbols and not by strings"
 	  (if* (<= got 0) then (return))
 	  (decf left got))))))
 
-(defun read-declared-body (length sock timeout)
+(defvar *max-body-bytes-in-flight* :auto
+  ;; the most body, in characters, all requests together may hold while
+  ;; they read: a backstop under *max-request-body-bytes*, which bounds
+  ;; one request and not the total.  A read that would pass it waits up to
+  ;; *body-budget-wait* seconds for room, then is turned away like a body
+  ;; over the limit, marked :budget.  Charged as the string grows, so an
+  ;; idle connection costs it 64K.  :auto is 128M characters, or on SBCL,
+  ;; whose heap is fixed and holds four bytes a character, a thirty-second
+  ;; of the heap the process runs with (32M of a 1 GB heap), never under
+  ;; the limit.  Keep a number above the limit too, or a body at the limit
+  ;; is never admitted.  nil means no budget.
+  ;; (Genworks, 2026-11-16; to go upstream.)
+  )
+
+(defvar *body-budget-wait* 5
+  ;; seconds a read waits for room in the budget before it is turned away
+  )
+
+(defvar *body-bytes-in-flight* 0)
+
+(defvar *body-budget-lock* (mp:make-process-lock :name "body budget"))
+
+(defun body-budget ()
+  ;; *max-body-bytes-in-flight* as a number, or nil; :auto is worked out
+  ;; when asked, since a saved image may run with another heap
+  (let ((budget *max-body-bytes-in-flight*))
+    (if* (eq budget :auto)
+       then (max (or *max-request-body-bytes* 0)
+		 #+sbcl (floor (sb-ext:dynamic-space-size) 32)
+		 #-sbcl (* 128 1024 1024))
+       else budget)))
+
+(defun reserve-body-bytes! (req n)
+  ;; take n more characters for req's body from the budget, waiting up to
+  ;; *body-budget-wait* seconds for room; true when taken
+  (let ((budget (body-budget)))
+    (if* (or (null budget) (<= n 0))
+       then t
+       else (let ((deadline (+ (get-internal-real-time)
+			       (* *body-budget-wait* internal-time-units-per-second))))
+	      (loop
+		(if* (mp:with-process-lock (*body-budget-lock*)
+		       (if* (<= (+ *body-bytes-in-flight* n) budget)
+			  then (incf *body-bytes-in-flight* n)
+			       (incf (getf (request-reply-plist req) 'body-reserved 0) n)
+			       t))
+		   then (return t))
+		(if* (> (get-internal-real-time) deadline) then (return nil))
+		(sleep 0.05))))))
+
+(defun release-body-bytes! (req)
+  ;; give back what req's body took from the budget; at the end of the
+  ;; request, however it ends (handle-request :around)
+  (let ((n (getf (request-reply-plist req) 'body-reserved 0)))
+    (if* (> n 0)
+       then (mp:with-process-lock (*body-budget-lock*)
+	      (decf *body-bytes-in-flight* n))
+	    (setf (getf (request-reply-plist req) 'body-reserved) 0))))
+
+(defun read-declared-body (req length sock timeout)
   ;; length characters of body from sock, read as they arrive: the string
   ;; starts at 64K and grows fourfold, and goes to the whole length once an
   ;; eighth of it has come, so what is held follows what the client has
@@ -2255,8 +2326,13 @@ by keyword symbols and not by strings"
   ;; body holds 64K; the whole string needs an eighth of the body sent.
   ;; Few steps, because each leaves its string for the collector: on
   ;; Allegro, doubling all the way cost a burst of bodies at the limit 1.7
-  ;; times the memory of making the string at once.  nil if things go wrong, as for
+  ;; times the memory of making the string at once.  Each step is charged
+  ;; to the budget (*max-body-bytes-in-flight*); a step it cannot take
+  ;; turns the body away and answers "".  nil if things go wrong, as for
   ;; read-sequence-with-timeout.  (Genworks, 2026-11-16; to go upstream.)
+  (if* (not (reserve-body-bytes! req (min length 65536)))
+     then (refuse-request-body req :budget)
+	  (return-from read-declared-body ""))
   (with-timeout-local (timeout nil)
     (let ((ans (make-string (min length 65536)))
 	  (got 0))
@@ -2264,11 +2340,15 @@ by keyword symbols and not by strings"
 	(if* (>= got length) then (return ans))
 	(if* (>= got (length ans))
 	   then ; full: grow, never past length
-		(let ((new (make-string (if* (>= got (floor length 8))
-					    then length
-					    else (min length (* 4 (length ans)))))))
-		  (replace new ans)
-		  (setq ans new)))
+		(let ((size (if* (>= got (floor length 8))
+			       then length
+			       else (min length (* 4 (length ans))))))
+		  (if* (not (reserve-body-bytes! req (- size (length ans))))
+		     then (refuse-request-body req :budget)
+			  (return ""))
+		  (let ((new (make-string size)))
+		    (replace new ans)
+		    (setq ans new))))
 	(let ((this (rational-read-sequence ans sock :start got
 						 :end (length ans))))
 	  (if* (<= this got)
@@ -2337,17 +2417,21 @@ by keyword symbols and not by strings"
 	  (if* (and believe-it (> length 0))
 	     then ;; we know the length
 		  (prog1 (read-declared-body
-			   length (request-socket req)
+			   req length (request-socket req)
 			   (wserver-read-request-body-timeout *wserver*))
 	    
 		    ;; netscape (at least) is buggy in that it sends a
 		    ;; crlf after the body.  We have to eat that crlf.
 		    ;; We could check which browser is calling us but
 		    ;; it's not clear what is the set of buggy
-		    ;; browsers
-		    (let ((ch (read-char-no-hang
-			       (request-socket req)
-			       nil nil)))
+		    ;; browsers.  Not after a body turned away part way:
+		    ;; the rest of it is still there, and unread-char of
+		    ;; a body byte fails on a zacl socket.
+		    (let ((ch (if* (getf (request-reply-plist req) 'body-refused)
+				 then nil
+				 else (read-char-no-hang
+				       (request-socket req)
+				       nil nil))))
 		      (if* (eq ch #\return)
 			 then		; now look for linefeed
 			      (setq ch (read-char-no-hang 
@@ -2386,7 +2470,12 @@ by keyword symbols and not by strings"
 					 then (setf (request-headers req)
 						(append (request-headers req) trailers))))
 				    (return ans)
-			       else (vector-push-extend
+			       else (if* (and (= (fill-pointer ans) (array-dimension ans 0))
+					   (not (reserve-body-bytes!
+						 req (body-extension ans))))
+					then (refuse-request-body req :budget)
+					     (return ""))
+				    (vector-push-extend
 				     ch ans (body-extension ans))
 				    (if* (body-over-limit-p (fill-pointer ans))
 				       then (refuse-request-body req)
@@ -2413,7 +2502,12 @@ by keyword symbols and not by strings"
 				       (read-char 
 					sock nil :eof)))
 			       then (return  ans)
-			       else (vector-push-extend
+			       else (if* (and (= (fill-pointer ans) (array-dimension ans 0))
+					   (not (reserve-body-bytes!
+						 req (body-extension ans))))
+					then (refuse-request-body req :budget)
+					     (return ""))
+				    (vector-push-extend
 				     ch ans (body-extension ans))
 				    (if* (body-over-limit-p (fill-pointer ans))
 				       then (refuse-request-body req)

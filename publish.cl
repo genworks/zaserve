@@ -2684,6 +2684,12 @@
 
 	    
 
+(defmethod handle-request :around ((req http-request))
+  ;; what this request's body took from the budget of bodies in flight
+  ;; goes back when the request ends, however it ends
+  (unwind-protect (call-next-method)
+    (release-body-bytes! req)))
+
 (defmethod compute-strategy :around ((req http-request) (ent entity) format)
   ;; a body too long to hold is not read, so the connection cannot be
   ;; kept: its bytes are still in the way of the next request
